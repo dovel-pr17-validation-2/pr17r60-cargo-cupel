@@ -1,0 +1,1644 @@
+//! Anthropic Messages API provider.
+//!
+//! Flow, build JSON request → POST `/v1/messages` with `stream` set to true →
+//! decode the SSE body → translate Anthropic events into unified
+//! `AssistantMessageEvent` values.
+//!
+//! Callers set `reasoning` and the provider derives the right
+//! thinking configuration for the model (adaptive effort vs. token budget).
+
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::{
+    error::{InferenceError, Result},
+    event_stream::{AssistantMessageStream, EventSink},
+    json_util::parse_streaming_json,
+    model::calculate_cost,
+    options_util::{adjust_max_tokens_for_thinking, clamp_max_tokens_to_context},
+    provider::Provider,
+    providers::{
+        CONTENT_FILTER_MESSAGE, EffortStyle, apply_custom_headers, compat, finish_output,
+        new_output_message, normalize_anthropic_tool_call_id, off_effort, parse_compat,
+        send_request, spawn_provider_stream, thinking_effort, with_cancel,
+    },
+    sse::{ServerSentEvent, SseDecoder},
+    transform::transform_messages,
+    types::{
+        Api, AssistantContent, AssistantMessage, CacheRetention, Context, Message, Model,
+        StopReason, StreamOptions, TextContent, ThinkingContent, Tool, ToolCall, ToolResultContent,
+        UserContent, UserContentBody,
+    },
+};
+
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// API specific compatibility knobs, deserialized from `model.compat`.
+/// `#[serde(default)]` on the struct means absent fields use `Default`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct AnthropicCompat {
+    force_adaptive_thinking: bool,
+    supports_temperature: bool,
+    supports_eager_tool_input_streaming: bool,
+    supports_cache_control_on_tools: bool,
+    supports_long_cache_retention: bool,
+    allow_empty_signature: bool,
+    send_session_affinity_headers: bool,
+    bearer_auth: bool,
+    prefix_mismatch_behavior: Option<String>,
+}
+
+impl Default for AnthropicCompat {
+    fn default() -> Self {
+        Self {
+            force_adaptive_thinking: false,
+            supports_temperature: true,
+            supports_eager_tool_input_streaming: true,
+            supports_cache_control_on_tools: true,
+            supports_long_cache_retention: true,
+            allow_empty_signature: false,
+            send_session_affinity_headers: false,
+            bearer_auth: false,
+            prefix_mismatch_behavior: None,
+        }
+    }
+}
+
+fn anthropic_compat(model: &Model) -> AnthropicCompat {
+    compat(model)
+}
+
+/// Claude Code subscription tokens only allow the Claude Code tool names.
+/// Outgoing tool names are canonicalized case insensitively,
+/// incoming ones are mapped back to the caller's original names.
+const CLAUDE_CODE_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+];
+
+fn is_oauth_token(api_key: &str) -> bool {
+    api_key.contains("sk-ant-oat")
+}
+
+fn to_claude_code_name(name: &str) -> String {
+    CLAUDE_CODE_TOOLS
+        .iter()
+        .find(|t| t.eq_ignore_ascii_case(name))
+        .map_or_else(|| name.to_string(), |t| (*t).to_string())
+}
+
+fn from_claude_code_name(name: &str, tools: Option<&[Tool]>) -> String {
+    tools
+        .and_then(|tools| tools.iter().find(|t| t.name.eq_ignore_ascii_case(name)))
+        .map_or_else(|| name.to_string(), |t| t.name.clone())
+}
+
+pub struct AnthropicProvider {
+    http: reqwest::Client,
+}
+
+impl AnthropicProvider {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            http: reqwest::Client::new(),
+        }
+    }
+}
+
+impl Default for AnthropicProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Provider for AnthropicProvider {
+    fn api(&self) -> &str {
+        Api::ANTHROPIC_MESSAGES
+    }
+
+    fn stream(
+        &self,
+        model: &Model,
+        context: Context,
+        options: StreamOptions,
+    ) -> AssistantMessageStream {
+        let http = self.http.clone();
+        spawn_provider_stream(model, move |model, sink| async move {
+            run(&http, &model, &context, &options, &sink).await
+        })
+    }
+
+    fn compat_problems(&self, model: &Model) -> Vec<String> {
+        parse_compat::<AnthropicCompat>(model).1
+    }
+}
+
+/// The streaming worker. Returns `Err` only for failures *before* a terminal
+/// event was emitted, protocol complete stops emit their terminal event
+/// themselves (including mapped error stops) and return `Ok`.
+#[tracing::instrument(name = "anthropic_request", skip_all, fields(model = %model.id, provider = %model.provider.as_str()))]
+async fn run(
+    http: &reqwest::Client,
+    model: &Model,
+    context: &Context,
+    options: &StreamOptions,
+    sink: &EventSink,
+) -> Result<()> {
+    let api_key = options
+        .api_key
+        .clone()
+        .ok_or_else(|| InferenceError::MissingApiKey(model.provider.as_str().to_string()))?;
+
+    let is_oauth = is_oauth_token(&api_key);
+    let compat = anthropic_compat(model);
+
+    let body = build_request_body(model, context, options, &compat, is_oauth);
+    // TRACE only, request bodies contain the user's code and prompts.
+    tracing::trace!(body = %body, "request body");
+    let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
+
+    let mut req = http
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("accept", "application/json");
+
+    let betas = request_betas(&compat, context, &body);
+
+    if is_oauth {
+        // OAuth, Bearer auth + Claude Code identity headers.
+        let mut oauth_betas = vec!["claude-code-20250219", "oauth-2025-04-20"];
+        oauth_betas.extend(betas.iter().copied());
+        req = req
+            .header("authorization", format!("Bearer {api_key}"))
+            .header("anthropic-beta", oauth_betas.join(","))
+            .header("x-app", "cli");
+    } else {
+        req = if compat.bearer_auth {
+            req.header("authorization", format!("Bearer {api_key}"))
+        } else {
+            req.header("x-api-key", &api_key)
+        };
+        if !betas.is_empty() {
+            req = req.header("anthropic-beta", betas.join(","));
+        }
+        // Cache shard affinity for gateways that ask for it (see compat).
+        // Only meaningful when caching is on, hence the retention check.
+        if compat.send_session_affinity_headers
+            && options.cache_retention != Some(CacheRetention::None)
+            && let Some(session_id) = &options.session_id
+        {
+            req = req.header("x-session-affinity", session_id);
+        }
+    }
+    req = apply_custom_headers(req, model, options);
+    if let Some(timeout) = options.timeout_ms {
+        req = req.timeout(core::time::Duration::from_millis(timeout));
+    }
+
+    let response = send_request(req.json(&body), options).await?;
+
+    // Stream + decode the SSE body.
+    let mut output = new_output_message(model);
+    if !sink.start() {
+        return Ok(()); // Consumer dropped the stream, stop working.
+    }
+
+    // Anthropic addresses content blocks by an `index` field. We track the
+    // mapping from that index to our position in `output.content`, plus the
+    // partial JSON scratch buffer for tool calls (which must never leak into
+    // the persisted message).
+    struct BlockState {
+        anthropic_index: u64,
+        kind: BlockKind,
+    }
+    enum BlockKind {
+        Text,
+        Thinking,
+        ToolCall { partial_json: String },
+    }
+    let mut blocks: Vec<BlockState> = Vec::new();
+    let find =
+        |blocks: &[BlockState], idx: u64| blocks.iter().position(|b| b.anthropic_index == idx);
+
+    use futures_util::StreamExt as _;
+    let mut byte_stream = response.bytes_stream();
+    let mut decoder = SseDecoder::new();
+    let mut events: Vec<ServerSentEvent> = Vec::new();
+    let mut saw_message_start = false;
+    let mut saw_message_stop = false;
+
+    'outer: loop {
+        let chunk = with_cancel(options, byte_stream.next()).await?;
+        let done = chunk.is_none();
+        match chunk {
+            Some(chunk) => decoder.push(&chunk?, &mut events),
+            None => decoder.finish(&mut events),
+        }
+
+        for sse in events.drain(..) {
+            // The server signals hard errors as an `event` field set to `error`.
+            if sse.event.as_deref() == Some("error") {
+                return Err(InferenceError::Other(sse.data));
+            }
+            let Ok(data) = serde_json::from_str::<Value>(&sse.data) else {
+                continue;
+            };
+            let event_type = data.get("type").and_then(Value::as_str).unwrap_or("");
+
+            match event_type {
+                "message_start" => {
+                    saw_message_start = true;
+                    // Capture response id + initial usage. Doing this here
+                    // (not only in message_delta) means we keep input counts
+                    // even if the stream is aborted early.
+                    if let Some(m) = data.get("message") {
+                        output.response_id =
+                            m.get("id").and_then(Value::as_str).map(str::to_string);
+                        let u = m.get("usage");
+                        output.usage.input = usage_u64(u, "input_tokens");
+                        output.usage.output = usage_u64(u, "output_tokens");
+                        output.usage.cache_read = usage_u64(u, "cache_read_input_tokens");
+                        output.usage.cache_write = usage_u64(u, "cache_creation_input_tokens");
+                        let write_1h = u
+                            .and_then(|u| u.get("cache_creation"))
+                            .and_then(|c| c.get("ephemeral_1h_input_tokens"))
+                            .and_then(Value::as_u64);
+                        output.usage.cache_write1h = write_1h;
+                        finalize_usage(model, &mut output);
+                    }
+                }
+
+                "content_block_start" => {
+                    let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let block = data.get("content_block");
+                    let block_type = block.and_then(|b| b.get("type")).and_then(Value::as_str);
+
+                    match block_type {
+                        Some("text") => {
+                            output
+                                .content
+                                .push(AssistantContent::Text(TextContent::plain("")));
+                            blocks.push(BlockState {
+                                anthropic_index: index,
+                                kind: BlockKind::Text,
+                            });
+                            if !sink.text_start(output.content.len() - 1) {
+                                break 'outer;
+                            }
+                        }
+                        Some("thinking") => {
+                            output
+                                .content
+                                .push(AssistantContent::Thinking(ThinkingContent {
+                                    thinking: String::new(),
+                                    thinking_signature: Some(String::new()),
+                                    redacted: None,
+                                }));
+                            blocks.push(BlockState {
+                                anthropic_index: index,
+                                kind: BlockKind::Thinking,
+                            });
+                            if !sink.thinking_start(output.content.len() - 1) {
+                                break 'outer;
+                            }
+                        }
+                        Some("redacted_thinking") => {
+                            // The encrypted payload arrives in `data`, keep it
+                            // in the signature so multi turn replay works.
+                            let signature = block
+                                .and_then(|b| b.get("data"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                            output
+                                .content
+                                .push(AssistantContent::Thinking(ThinkingContent {
+                                    thinking: "[Reasoning redacted]".to_string(),
+                                    thinking_signature: signature,
+                                    redacted: Some(true),
+                                }));
+                            blocks.push(BlockState {
+                                anthropic_index: index,
+                                kind: BlockKind::Thinking,
+                            });
+                            if !sink.thinking_start(output.content.len() - 1) {
+                                break 'outer;
+                            }
+                        }
+                        Some("tool_use") => {
+                            let id = block
+                                .and_then(|b| b.get("id"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let raw_name = block
+                                .and_then(|b| b.get("name"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let name = if is_oauth {
+                                from_claude_code_name(raw_name, context.tools.as_deref())
+                            } else {
+                                raw_name.to_string()
+                            };
+                            output.content.push(AssistantContent::ToolCall(ToolCall {
+                                id,
+                                name,
+                                arguments: json!({}),
+                            }));
+                            blocks.push(BlockState {
+                                anthropic_index: index,
+                                kind: BlockKind::ToolCall {
+                                    partial_json: String::new(),
+                                },
+                            });
+                            if !sink.toolcall_start(output.content.len() - 1) {
+                                break 'outer;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                "content_block_delta" => {
+                    let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let Some(pos) = find(&blocks, index) else {
+                        continue;
+                    };
+                    let delta = data.get("delta");
+                    let delta_type = delta.and_then(|d| d.get("type")).and_then(Value::as_str);
+
+                    match delta_type {
+                        Some("text_delta") => {
+                            let text = delta
+                                .and_then(|d| d.get("text"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if let Some(AssistantContent::Text(block)) = output.content.get_mut(pos)
+                            {
+                                block.text.push_str(text);
+                                if !sink.text_delta(pos, text.to_string()) {
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        Some("thinking_delta") => {
+                            let text = delta
+                                .and_then(|d| d.get("thinking"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if let Some(AssistantContent::Thinking(block)) =
+                                output.content.get_mut(pos)
+                            {
+                                block.thinking.push_str(text);
+                                if !sink.thinking_delta(pos, text.to_string()) {
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            let fragment = delta
+                                .and_then(|d| d.get("partial_json"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if let Some(BlockState {
+                                kind: BlockKind::ToolCall { partial_json },
+                                ..
+                            }) = blocks.get_mut(pos)
+                            {
+                                partial_json.push_str(fragment);
+                                let parsed = parse_streaming_json(partial_json);
+                                if let Some(AssistantContent::ToolCall(tc)) =
+                                    output.content.get_mut(pos)
+                                {
+                                    tc.arguments = parsed;
+                                }
+                                if !sink.toolcall_delta(pos, fragment.to_string()) {
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        Some("signature_delta") => {
+                            let fragment = delta
+                                .and_then(|d| d.get("signature"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if let Some(AssistantContent::Thinking(block)) =
+                                output.content.get_mut(pos)
+                            {
+                                block
+                                    .thinking_signature
+                                    .get_or_insert_with(String::new)
+                                    .push_str(fragment);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                "content_block_stop" => {
+                    let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let Some(pos) = find(&blocks, index) else {
+                        continue;
+                    };
+                    match &blocks[pos].kind {
+                        BlockKind::Text => {
+                            if let Some(AssistantContent::Text(block)) = output.content.get(pos)
+                                && !sink.text_end(pos, block.text.clone())
+                            {
+                                break 'outer;
+                            }
+                        }
+                        BlockKind::Thinking => {
+                            if let Some(AssistantContent::Thinking(block)) = output.content.get(pos)
+                                && !sink.thinking_end(pos, block.thinking.clone())
+                            {
+                                break 'outer;
+                            }
+                        }
+                        BlockKind::ToolCall { partial_json } => {
+                            // Final parse of the completed JSON, the scratch
+                            // buffer lives in `blocks` and is dropped here.
+                            let parsed = parse_streaming_json(partial_json);
+                            if let Some(AssistantContent::ToolCall(tc)) =
+                                output.content.get_mut(pos)
+                            {
+                                tc.arguments = parsed;
+                                if !sink.toolcall_end(pos, tc.clone()) {
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                "message_delta" => {
+                    if let Some(delta) = data.get("delta")
+                        && let Some(reason) = delta.get("stop_reason").and_then(Value::as_str)
+                    {
+                        let (stop_reason, error) =
+                            map_stop_reason(reason, delta.get("stop_details"));
+                        output.stop_reason = stop_reason;
+                        if let Some(error) = error {
+                            output.error_message = Some(error);
+                        }
+                    }
+                    // Only update usage fields that are present (not null),
+                    // some proxies omit input_tokens here, and we must keep
+                    // the value captured at message_start.
+                    if let Some(u) = data.get("usage") {
+                        if let Some(v) = u.get("input_tokens").and_then(Value::as_u64) {
+                            output.usage.input = v;
+                        }
+                        if let Some(v) = u.get("output_tokens").and_then(Value::as_u64) {
+                            output.usage.output = v;
+                        }
+                        if let Some(v) = u.get("cache_read_input_tokens").and_then(Value::as_u64) {
+                            output.usage.cache_read = v;
+                        }
+                        if let Some(v) =
+                            u.get("cache_creation_input_tokens").and_then(Value::as_u64)
+                        {
+                            output.usage.cache_write = v;
+                        }
+                        // Reasoning tokens appear in output_tokens_details on
+                        // the final delta (subset of output_tokens).
+                        if let Some(v) = u
+                            .get("output_tokens_details")
+                            .and_then(|d| d.get("thinking_tokens"))
+                            .and_then(Value::as_u64)
+                        {
+                            output.usage.reasoning = Some(v);
+                        }
+                        finalize_usage(model, &mut output);
+                    }
+                }
+
+                "message_stop" => {
+                    saw_message_stop = true;
+                }
+
+                _ => {}
+            }
+        }
+
+        if done {
+            break;
+        }
+    }
+
+    // A 200 response may still be a non streaming JSON body or gateway HTML.
+    // Neither is a completed assistant turn, even when the body closes cleanly.
+    if !saw_message_start {
+        return Err(InferenceError::Transport(
+            "Anthropic stream ended without message_start".to_string(),
+        ));
+    }
+    if !saw_message_stop {
+        return Err(InferenceError::Transport(
+            "Anthropic stream ended before message_stop".to_string(),
+        ));
+    }
+
+    finish_output(output, sink);
+    Ok(())
+}
+
+/// The Anthropic beta header values this request needs, OAuth adds its own on
+/// top. A free function (not inline in `run`) so tests can check it.
+fn request_betas(compat: &AnthropicCompat, context: &Context, body: &Value) -> Vec<&'static str> {
+    let has_tools = context.tools.as_ref().is_some_and(|t| !t.is_empty());
+    let mut betas = Vec::new();
+    // Adaptive thinking models have interleaved thinking built in → skip beta.
+    if !compat.force_adaptive_thinking {
+        betas.push(INTERLEAVED_THINKING_BETA);
+    }
+    // Only needed when the endpoint can't stream tool input eagerly.
+    if has_tools && !compat.supports_eager_tool_input_streaming {
+        betas.push(FINE_GRAINED_TOOL_STREAMING_BETA);
+    }
+    // `block_binding` without this header is a 400, so the header follows
+    // the finished body instead of the compat flag.
+    if body.pointer("/thinking/block_binding").is_some() {
+        betas.push(THINKING_BINDING_BETA);
+    }
+    betas
+}
+
+/// Anthropic doesn't send `total_tokens`, compute it from the components,
+/// then derive cost from the model's pricing.
+fn finalize_usage(model: &Model, output: &mut AssistantMessage) {
+    output.usage.total_tokens = output.usage.input
+        + output.usage.output
+        + output.usage.cache_read
+        + output.usage.cache_write;
+    calculate_cost(model, &mut output.usage);
+}
+
+fn usage_u64(usage: Option<&Value>, key: &str) -> u64 {
+    usage
+        .and_then(|u| u.get(key))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn map_stop_reason(reason: &str, stop_details: Option<&Value>) -> (StopReason, Option<String>) {
+    match reason {
+        "end_turn" | "pause_turn" | "stop_sequence" => (StopReason::Stop, None),
+        "max_tokens" => (StopReason::Length, None),
+        "tool_use" => (StopReason::ToolUse, None),
+        "refusal" => {
+            let explanation = stop_details
+                .and_then(|d| d.get("explanation"))
+                .and_then(Value::as_str)
+                .unwrap_or("The model refused to complete the request")
+                .to_string();
+            (StopReason::Error, Some(explanation))
+        }
+        // Content flagged by safety filters.
+        "sensitive" => (StopReason::Error, Some(CONTENT_FILTER_MESSAGE.to_string())),
+        other => (
+            StopReason::Error,
+            Some(format!("Unhandled stop reason: {other}")),
+        ),
+    }
+}
+
+/// The `cache_control` JSON attached to cacheable blocks, or `None` when the
+/// caller disabled caching. Prompt caching is what makes multi turn agent
+/// loops affordable, unchanged prefix tokens are re read at ~10% of the price.
+fn cache_control_value(options: &StreamOptions, compat: &AnthropicCompat) -> Option<Value> {
+    let retention = options.cache_retention.unwrap_or(CacheRetention::Short);
+    match retention {
+        CacheRetention::None => None,
+        CacheRetention::Long if compat.supports_long_cache_retention => {
+            Some(json!({"type": "ephemeral", "ttl": "1h"}))
+        }
+        _ => Some(json!({"type": "ephemeral"})),
+    }
+}
+
+fn build_request_body(
+    model: &Model,
+    context: &Context,
+    options: &StreamOptions,
+    compat: &AnthropicCompat,
+    is_oauth: bool,
+) -> Value {
+    let cache_control = cache_control_value(options, compat);
+
+    // The unified reasoning level decides
+    // between adaptive effort and token budgets (Anthropic compatible gateways),
+    // and budget based thinking needs max_tokens head room.
+    let mut thinking: Option<Value> = None;
+    let mut output_config: Option<Value> = None;
+    let mut thinking_enabled = false;
+
+    let mut max_tokens = clamp_max_tokens_to_context(
+        model,
+        context,
+        options.max_tokens.unwrap_or(model.max_tokens),
+    );
+
+    if model.reasoning {
+        match options.reasoning {
+            Some(level) => {
+                if compat.force_adaptive_thinking {
+                    // Adaptive, the model decides when/how much to think, we
+                    // only steer with an effort level. "summarized" keeps the
+                    // display behavior consistent with budget based thinking.
+                    if let Some(effort) = thinking_effort(
+                        model,
+                        Some(level),
+                        EffortStyle::Claude { native_xhigh: true },
+                    ) {
+                        thinking_enabled = true;
+                        thinking = Some(json!({"type": "adaptive", "display": "summarized"}));
+                        output_config = Some(json!({"effort": effort}));
+                    } else {
+                        thinking = off_effort(model, Some("disabled"))
+                            .map(|off_type| json!({"type": off_type}));
+                    }
+                } else {
+                    thinking_enabled = true;
+                    let adjusted = adjust_max_tokens_for_thinking(
+                        options.max_tokens,
+                        model.max_tokens,
+                        level,
+                        options.thinking_budgets,
+                    );
+                    max_tokens = clamp_max_tokens_to_context(model, context, adjusted.max_tokens);
+                    let budget = adjusted
+                        .thinking_budget
+                        .min(max_tokens.saturating_sub(1024));
+                    thinking = Some(json!({
+                        "type": "enabled",
+                        "budget_tokens": budget.max(1024),
+                        "display": "summarized",
+                    }));
+                }
+            }
+            None => {
+                // "off" reads the model's level map like the OpenAI
+                // providers do, no entry sends the classic `disabled`, a
+                // named entry is the thinking type to send instead
+                // (Sonnet 5.5 rejects `disabled`, its off is
+                // `between_tools`), and null means the model cannot be
+                // switched off, so `thinking` is left out entirely.
+                // The type travels alone, `between_tools` answers any
+                // other field (even `display`) with a 400.
+                thinking =
+                    off_effort(model, Some("disabled")).map(|off_type| json!({"type": off_type}));
+            }
+        }
+    }
+
+    // Preserved thinking (see compat), only adaptive and budget thinking
+    // take `block_binding`. `between_tools` answers it with a 400, and an
+    // omitted `thinking` has nothing to attach it to, for those requests
+    // the agent loop strips the stale blocks and retries instead.
+    if let Some(behavior) = &compat.prefix_mismatch_behavior
+        && let Some(config) = &mut thinking
+        && matches!(config["type"].as_str(), Some("adaptive" | "enabled"))
+    {
+        config["block_binding"] = json!({"prefix_mismatch_behavior": behavior});
+    }
+
+    let mut body = json!({
+        "model": model.id,
+        "messages": convert_messages(context, model, is_oauth, cache_control.as_ref(), compat),
+        "max_tokens": max_tokens,
+        "stream": true,
+    });
+
+    // OAuth tokens must lead with the Claude Code identity string.
+    let mut system: Vec<Value> = Vec::new();
+    if is_oauth {
+        let mut identity = json!({
+            "type": "text",
+            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+        });
+        if let Some(cc) = &cache_control {
+            identity["cache_control"] = cc.clone();
+        }
+        system.push(identity);
+    }
+    if let Some(prompt) = &context.system_prompt {
+        let mut block = json!({"type": "text", "text": prompt});
+        if let Some(cc) = &cache_control {
+            block["cache_control"] = cc.clone();
+        }
+        system.push(block);
+    }
+    if !system.is_empty() {
+        body["system"] = Value::Array(system);
+    }
+
+    // Temperature is incompatible with extended thinking and unsupported on
+    // adaptive Claude models.
+    if let Some(temperature) = options.temperature
+        && !thinking_enabled
+        && compat.supports_temperature
+    {
+        body["temperature"] = json!(temperature);
+    }
+
+    if let Some(tools) = &context.tools
+        && !tools.is_empty()
+    {
+        let tool_cache_control = compat
+            .supports_cache_control_on_tools
+            .then_some(cache_control.as_ref())
+            .flatten();
+        body["tools"] = convert_tools(
+            tools,
+            is_oauth,
+            compat.supports_eager_tool_input_streaming,
+            tool_cache_control,
+        );
+    }
+
+    if let Some(thinking) = thinking {
+        body["thinking"] = thinking;
+    }
+    if let Some(output_config) = output_config {
+        body["output_config"] = output_config;
+    }
+
+    if let Some(metadata) = &options.metadata
+        && let Some(Value::String(user_id)) = metadata.get("user_id")
+    {
+        body["metadata"] = json!({"user_id": user_id});
+    }
+
+    body
+}
+
+fn convert_messages(
+    context: &Context,
+    model: &Model,
+    is_oauth: bool,
+    cache_control: Option<&Value>,
+    compat: &AnthropicCompat,
+) -> Value {
+    let transformed = transform_messages(
+        &context.messages,
+        model,
+        Some(normalize_anthropic_tool_call_id),
+    );
+    let mut params: Vec<Value> = Vec::new();
+
+    let mut i = 0;
+    while i < transformed.len() {
+        match &transformed[i] {
+            Message::User(user) => {
+                match &user.content {
+                    UserContentBody::Text(text) => {
+                        if !text.trim().is_empty() {
+                            params.push(json!({"role": "user", "content": text}));
+                        }
+                    }
+                    UserContentBody::Blocks(blocks) => {
+                        let converted: Vec<Value> = blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                UserContent::Text(t) if t.text.trim().is_empty() => None,
+                                UserContent::Text(t) => {
+                                    Some(json!({"type": "text", "text": t.text}))
+                                }
+                                UserContent::Image(image) => Some(json!({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": image.mime_type,
+                                        "data": image.data,
+                                    },
+                                })),
+                            })
+                            .collect();
+                        if !converted.is_empty() {
+                            params.push(json!({"role": "user", "content": converted}));
+                        }
+                    }
+                }
+                i += 1;
+            }
+
+            Message::Assistant(assistant) => {
+                let mut blocks: Vec<Value> = Vec::new();
+                for block in &assistant.content {
+                    match block {
+                        AssistantContent::Text(text) => {
+                            if text.text.trim().is_empty() {
+                                continue;
+                            }
+                            blocks.push(json!({"type": "text", "text": text.text}));
+                        }
+                        AssistantContent::Thinking(thinking) => {
+                            // Redacted thinking, pass the opaque payload back.
+                            if thinking.redacted == Some(true) {
+                                blocks.push(json!({
+                                    "type": "redacted_thinking",
+                                    "data": thinking.thinking_signature.clone().unwrap_or_default(),
+                                }));
+                                continue;
+                            }
+                            if thinking.thinking.trim().is_empty() {
+                                continue;
+                            }
+                            let signature_missing = thinking
+                                .thinking_signature
+                                .as_ref()
+                                .is_none_or(|s| s.trim().is_empty());
+                            if signature_missing {
+                                // No signature (e.g. from an aborted stream),
+                                // real Anthropic rejects the block, so demote
+                                // to plain text unless the endpoint accepts
+                                // empty signatures.
+                                if compat.allow_empty_signature {
+                                    blocks.push(json!({
+                                        "type": "thinking",
+                                        "thinking": thinking.thinking,
+                                        "signature": "",
+                                    }));
+                                } else {
+                                    blocks.push(json!({
+                                        "type": "text",
+                                        "text": thinking.thinking,
+                                    }));
+                                }
+                            } else {
+                                blocks.push(json!({
+                                    "type": "thinking",
+                                    "thinking": thinking.thinking,
+                                    "signature": thinking.thinking_signature,
+                                }));
+                            }
+                        }
+                        AssistantContent::ToolCall(tool_call) => {
+                            let name = if is_oauth {
+                                to_claude_code_name(&tool_call.name)
+                            } else {
+                                tool_call.name.clone()
+                            };
+                            blocks.push(json!({
+                                "type": "tool_use",
+                                "id": tool_call.id,
+                                "name": name,
+                                "input": tool_call.arguments,
+                            }));
+                        }
+                    }
+                }
+                if !blocks.is_empty() {
+                    params.push(json!({"role": "assistant", "content": blocks}));
+                }
+                i += 1;
+            }
+
+            Message::ToolResult(_) => {
+                // Collect all consecutive tool results into one user message,
+                // some Anthropic compatible endpoints require this.
+                let mut tool_results: Vec<Value> = Vec::new();
+                while let Some(Message::ToolResult(result)) = transformed.get(i) {
+                    tool_results.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": result.tool_call_id,
+                        "content": convert_tool_result_content(&result.content),
+                        "is_error": result.is_error,
+                    }));
+                    i += 1;
+                }
+                params.push(json!({"role": "user", "content": tool_results}));
+            }
+        }
+    }
+
+    // Attach cache_control to the last user message so the whole conversation
+    // prefix is cached for the next turn.
+    if let Some(cc) = cache_control
+        && let Some(last) = params.last_mut()
+        && last.get("role").and_then(Value::as_str) == Some("user")
+    {
+        match last.get_mut("content") {
+            Some(Value::Array(blocks)) => {
+                if let Some(last_block) = blocks.last_mut() {
+                    last_block["cache_control"] = cc.clone();
+                }
+            }
+            Some(content @ Value::String(_)) => {
+                // Plain string content can't carry cache_control, convert to
+                // a single text block first.
+                let text = content.as_str().unwrap_or("").to_string();
+                *content = json!([{"type": "text", "text": text, "cache_control": cc}]);
+            }
+            _ => {}
+        }
+    }
+
+    Value::Array(params)
+}
+
+/// Tool results are either a plain string (text only) or an array of blocks
+/// when images are present.
+fn convert_tool_result_content(content: &[ToolResultContent]) -> Value {
+    let has_images = content
+        .iter()
+        .any(|c| matches!(c, ToolResultContent::Image(_)));
+    if !has_images {
+        let text: Vec<&str> = content
+            .iter()
+            .filter_map(|c| match c {
+                ToolResultContent::Text(t) => Some(t.text.as_str()),
+                ToolResultContent::Image(_) => None,
+            })
+            .collect();
+        return Value::String(text.join("\n"));
+    }
+
+    let blocks: Vec<Value> = content
+        .iter()
+        .map(|c| match c {
+            ToolResultContent::Text(t) => json!({"type": "text", "text": t.text}),
+            ToolResultContent::Image(image) => json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image.mime_type,
+                    "data": image.data,
+                },
+            }),
+        })
+        .collect();
+    Value::Array(blocks)
+}
+
+fn convert_tools(
+    tools: &[Tool],
+    is_oauth: bool,
+    supports_eager_input_streaming: bool,
+    cache_control: Option<&Value>,
+) -> Value {
+    let last = tools.len().saturating_sub(1);
+    Value::Array(
+        tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| {
+                let name = if is_oauth {
+                    to_claude_code_name(&tool.name)
+                } else {
+                    tool.name.clone()
+                };
+                let mut converted = json!({
+                    "name": name,
+                    "description": tool.description,
+                    "input_schema": tool.parameters,
+                });
+                if supports_eager_input_streaming {
+                    converted["eager_input_streaming"] = json!(true);
+                }
+                // Caching the tool block caches every (unchanged) tool schema.
+                if index == last
+                    && let Some(cc) = cache_control
+                {
+                    converted["cache_control"] = cc.clone();
+                }
+                converted
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use crate::error::MessageStreamError;
+    use crate::provider::Provider as _;
+    use crate::providers::anthropic::{
+        AnthropicProvider, THINKING_BINDING_BETA, anthropic_compat, build_request_body,
+        request_betas,
+    };
+    use crate::retry::is_retryable_assistant_error;
+    use crate::types::{
+        AssistantMessage, Context, Message, Model, StopReason, StreamOptions, ThinkingLevel,
+        UserContentBody, UserMessage, now_ms,
+    };
+
+    /// A row from the shipped catalog, not a hand built fixture, these
+    /// tests break if catalog.json and this provider drift apart.
+    fn catalog_model(id: &str) -> Model {
+        crate::catalog::builtin_models()
+            .into_iter()
+            .find(|m| m.id == id)
+            .expect("model in catalog")
+    }
+
+    fn hello() -> Context {
+        Context {
+            system_prompt: Some("You are cupel.".to_string()),
+            messages: vec![Message::User(UserMessage {
+                content: UserContentBody::Text("hi".to_string()),
+                timestamp: now_ms(),
+            })],
+            tools: None,
+        }
+    }
+
+    #[test]
+    fn tool_request_preserves_selector_constraints_and_schema_definitions() {
+        let model = catalog_model("accounts/fireworks/models/minimax-m3");
+        let schemas = [
+            json!({
+                "type":"object", "properties":{
+                    "agent":{"type":"string"},
+                    "role":{"$ref":"#/$defs/role"},
+                    "task":{"type":"string","minLength":1}
+                },
+                "required":["task"],
+                "oneOf":[{"required":["agent"]},{"required":["role"]}],
+                "additionalProperties":false,
+                "$defs":{"role":{"type":"string","enum":["review","research"]}}
+            }),
+            json!({
+                "type":"object", "properties":{
+                    "call":{"type":"integer","minimum":0},
+                    "after":{"type":"integer","minimum":0}
+                },
+                "not":{"required":["call","after"]},
+                "additionalProperties":false
+            }),
+        ];
+        let mut context = hello();
+        context.tools = Some(
+            schemas
+                .iter()
+                .enumerate()
+                .map(|(index, schema)| crate::types::Tool {
+                    name: format!("fixture_{index}"),
+                    description: "Fixture tool".into(),
+                    parameters: schema.clone(),
+                })
+                .collect(),
+        );
+        let compat = anthropic_compat(&model);
+        for is_oauth in [false, true] {
+            let body = build_request_body(
+                &model,
+                &context,
+                &StreamOptions::default(),
+                &compat,
+                is_oauth,
+            );
+            for (index, schema) in schemas.iter().enumerate() {
+                assert_eq!(&body["tools"][index]["input_schema"], schema);
+            }
+        }
+    }
+
+    /// The body exactly as `run` builds it, minus the network.
+    fn body_for(model: &Model, options: &StreamOptions) -> Value {
+        let compat = anthropic_compat(model);
+        build_request_body(model, &hello(), options, &compat, false)
+    }
+
+    /// Exercise the actual HTTP/SSE adapter against a bounded local response.
+    async fn stream_body(
+        body: &str,
+        content_type: &str,
+    ) -> Result<AssistantMessage, MessageStreamError> {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            reader
+                .read_exact(&mut vec![0; content_length])
+                .await
+                .unwrap();
+            writer.write_all(response.as_bytes()).await.unwrap();
+        });
+        let mut model = catalog_model("claude-haiku-5-5");
+        model.base_url = format!("http://{address}");
+        let options = StreamOptions {
+            api_key: Some("test".into()),
+            timeout_ms: Some(5_000),
+            ..StreamOptions::default()
+        };
+        let result = AnthropicProvider::new()
+            .stream(&model, hello(), options)
+            .result()
+            .await;
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn streams_without_message_start_are_retryable_errors() {
+        for (body, content_type) in [
+            ("", "text/event-stream"),
+            ("<html>Scheduled maintenance</html>", "text/html"),
+            (
+                r#"{"type":"message","content":[],"stop_reason":"end_turn"}"#,
+                "application/json",
+            ),
+            ("data: {\"type\":\"ping\"}\n\n", "text/event-stream"),
+            ("data: {\"type\":\"message_stop\"}\n\n", "text/event-stream"),
+        ] {
+            let error = stream_body(body, content_type).await.unwrap_err();
+            let MessageStreamError::ProviderError { reason, message } = error else {
+                panic!("expected an in-band provider error");
+            };
+            assert_eq!(reason, StopReason::Error);
+            assert_eq!(
+                message.error_message.as_deref(),
+                Some("Anthropic stream ended without message_start")
+            );
+            assert!(is_retryable_assistant_error(&message));
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_without_message_stop_is_a_retryable_error() {
+        let body = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\"}}\n\n";
+        let error = stream_body(body, "text/event-stream").await.unwrap_err();
+        let MessageStreamError::ProviderError { reason, message } = error else {
+            panic!("expected an in-band provider error");
+        };
+        assert_eq!(reason, StopReason::Error);
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("Anthropic stream ended before message_stop")
+        );
+        assert!(is_retryable_assistant_error(&message));
+    }
+
+    #[tokio::test]
+    async fn complete_empty_stream_is_successful() {
+        // Empty content is legitimate when both protocol markers arrived.
+        let body = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+        let message = stream_body(body, "text/event-stream").await.unwrap();
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert_eq!(message.response_id.as_deref(), Some("msg_test"));
+        assert!(message.content.is_empty());
+    }
+
+    async fn request_head(compat: Option<Value>) -> String {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            let mut head = String::new();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse::<usize>().unwrap();
+                }
+                head.push_str(&line);
+            }
+            reader
+                .read_exact(&mut vec![0; content_length])
+                .await
+                .unwrap();
+            writer
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            head
+        });
+        let mut model = catalog_model("claude-haiku-5-5");
+        model.base_url = format!("http://{address}");
+        model.compat = compat;
+        let options = StreamOptions {
+            api_key: Some("test-key".into()),
+            timeout_ms: Some(5_000),
+            ..StreamOptions::default()
+        };
+        let _ = AnthropicProvider::new()
+            .stream(&model, hello(), options)
+            .result()
+            .await;
+        server.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_moves_the_key_into_the_authorization_header() {
+        let head = request_head(None).await;
+        assert!(head.contains("\r\nx-api-key: test-key\r\n"), "{head}");
+        assert!(!head.contains("authorization:"), "{head}");
+
+        let head = request_head(Some(json!({"bearerAuth": true}))).await;
+        assert!(
+            head.contains("\r\nauthorization: Bearer test-key\r\n"),
+            "{head}"
+        );
+        assert!(!head.contains("x-api-key:"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn refusal_and_sensitive_stops_preserve_partial_output_and_usage() {
+        use core::fmt::Write as _;
+
+        for reason in ["refusal", "sensitive"] {
+            let body: String = [
+                json!({"type": "message_start", "message": {"id": "msg_test", "usage": {"input_tokens": 10}}}),
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "partial output"}}),
+                json!({"type": "content_block_stop", "index": 0}),
+                json!({"type": "message_delta", "delta": {"stop_reason": reason}, "usage": {"output_tokens": 2}}),
+                json!({"type": "message_stop"}),
+            ]
+            .iter()
+            .fold(String::new(), |mut body, event| {
+                writeln!(body, "data: {event}\n").unwrap();
+                body
+            });
+            let error = stream_body(&body, "text/event-stream").await.unwrap_err();
+            let MessageStreamError::ProviderError {
+                reason: stop,
+                message,
+            } = error
+            else {
+                panic!("expected a provider error");
+            };
+            assert_eq!(stop, StopReason::Error);
+            assert!(!is_retryable_assistant_error(&message));
+            assert!(message.error_message.as_deref().is_some_and(|text| {
+                text.contains(if reason == "refusal" {
+                    "refused"
+                } else {
+                    "content filter"
+                })
+            }));
+            assert_eq!(message.response_id.as_deref(), Some("msg_test"));
+            assert_eq!(message.usage.input, 10);
+            assert_eq!(message.usage.output, 2);
+            assert_eq!(message.usage.total_tokens, 12);
+            assert_eq!(
+                message.content,
+                vec![crate::types::AssistantContent::Text(
+                    crate::types::TextContent::plain("partial output")
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn opus55_off_omits_thinking_and_temperature() {
+        // `/thinking off` arrives as `reasoning` set to `None`. A budget model
+        // turns that into an explicit `disabled` and keeps temperature ...
+        let options = StreamOptions {
+            temperature: Some(0.2),
+            ..StreamOptions::default()
+        };
+        let budget = catalog_model("accounts/fireworks/models/inkling");
+        let body = body_for(&budget, &options);
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert_eq!(body["temperature"], json!(0.2));
+
+        // ... both of which Opus 5.5 answers with a 400. Its "off", null
+        // entry makes the provider send no `thinking` at all (the API then
+        // thinks adaptively at its default effort, medium), and
+        // supportsTemperature, false drops the sampling parameter.
+        let opus = catalog_model("claude-opus-5-5");
+        let body = body_for(&opus, &options);
+        assert!(body.get("thinking").is_none(), "{body}");
+        assert!(body.get("output_config").is_none(), "{body}");
+        assert!(body.get("temperature").is_none(), "{body}");
+    }
+
+    #[test]
+    fn opus55_levels_map_to_adaptive_effort() {
+        let opus = catalog_model("claude-opus-5-5");
+        for (level, effort) in [
+            // No "minimal" effort upstream, the map's null entry falls
+            // back to the provider default, which is "low".
+            (ThinkingLevel::Minimal, "low"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::XHigh, "xhigh"),
+            (ThinkingLevel::Max, "max"),
+        ] {
+            let options = StreamOptions {
+                reasoning: Some(level),
+                ..StreamOptions::default()
+            };
+            let body = body_for(&opus, &options);
+            // Adaptive, never `enabled` with a `budget_tokens`. The
+            // block_binding comes from preserved thinking (see
+            // preserved_thinking_binds_adaptive_requests_only).
+            assert_eq!(
+                body["thinking"],
+                json!({
+                    "type": "adaptive",
+                    "display": "summarized",
+                    "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+                }),
+                "{level:?}"
+            );
+            assert_eq!(
+                body["output_config"],
+                json!({"effort": effort}),
+                "{level:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_effort_clamps_unsupported_levels_before_applying_aliases() {
+        let mut model = catalog_model("claude-sonnet-5-5");
+        let map = model
+            .thinking_level_map
+            .get_or_insert_with(Default::default);
+        map.insert("low".to_string(), None);
+        map.insert("medium".to_string(), Some("balanced".to_string()));
+        map.insert("high".to_string(), None);
+        map.insert("xhigh".to_string(), None);
+        map.insert("max".to_string(), None);
+        for level in [
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::High,
+            ThinkingLevel::Max,
+        ] {
+            let body = body_for(
+                &model,
+                &StreamOptions {
+                    reasoning: Some(level),
+                    ..StreamOptions::default()
+                },
+            );
+            assert_eq!(body["thinking"]["type"], "adaptive");
+            assert_eq!(body["output_config"]["effort"], "balanced");
+        }
+    }
+
+    #[test]
+    fn sonnet5_and_opus5_off_never_send_temperature() {
+        // `/thinking off` with a temperature set. Sonnet 5 has no "off"
+        // entry in its map (models.dev lists a toggle), so it gets the
+        // explicit `disabled` that it accepts. Opus 5 has "off", null
+        // and gets no `thinking` at all, the API then thinks adaptively
+        // at its default effort, high. Neither may carry `temperature`,
+        // a non default value is a 400 on both.
+        let options = StreamOptions {
+            temperature: Some(0.2),
+            ..StreamOptions::default()
+        };
+        let sonnet = catalog_model("claude-sonnet-5");
+        let body = body_for(&sonnet, &options);
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(body.get("output_config").is_none(), "{body}");
+        assert!(body.get("temperature").is_none(), "{body}");
+
+        let opus = catalog_model("claude-opus-5");
+        let body = body_for(&opus, &options);
+        assert!(body.get("thinking").is_none(), "{body}");
+        assert!(body.get("output_config").is_none(), "{body}");
+        assert!(body.get("temperature").is_none(), "{body}");
+    }
+
+    #[test]
+    fn sonnet5_and_opus5_levels_map_to_adaptive_effort() {
+        // cupel's default level is medium, so before these rows went
+        // adaptive, the very first request to the default model carried
+        // a `budget_tokens` and came back as a 400.
+        for id in ["claude-sonnet-5", "claude-opus-5"] {
+            let model = catalog_model(id);
+            for (level, effort) in [
+                (ThinkingLevel::Minimal, "low"),
+                (ThinkingLevel::Low, "low"),
+                (ThinkingLevel::Medium, "medium"),
+                (ThinkingLevel::High, "high"),
+                (ThinkingLevel::XHigh, "xhigh"),
+                (ThinkingLevel::Max, "max"),
+            ] {
+                let options = StreamOptions {
+                    reasoning: Some(level),
+                    ..StreamOptions::default()
+                };
+                let body = body_for(&model, &options);
+                assert_eq!(
+                    body["thinking"],
+                    json!({"type": "adaptive", "display": "summarized"}),
+                    "{id} {level:?}"
+                );
+                assert_eq!(
+                    body["output_config"],
+                    json!({"effort": effort}),
+                    "{id} {level:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fable5_and_51_use_adaptive_thinking_without_temperature() {
+        for id in ["claude-fable-5", "claude-fable-5-1"] {
+            let model = catalog_model(id);
+            let off = body_for(
+                &model,
+                &StreamOptions {
+                    temperature: Some(0.2),
+                    ..StreamOptions::default()
+                },
+            );
+            assert!(off.get("thinking").is_none(), "{id}: {off}");
+            assert!(off.get("temperature").is_none(), "{id}: {off}");
+
+            for (level, effort) in [
+                (ThinkingLevel::Minimal, "low"),
+                (ThinkingLevel::XHigh, "xhigh"),
+                (ThinkingLevel::Max, "max"),
+            ] {
+                let body = body_for(
+                    &model,
+                    &StreamOptions {
+                        reasoning: Some(level),
+                        ..StreamOptions::default()
+                    },
+                );
+                assert_eq!(
+                    body["thinking"],
+                    json!({"type": "adaptive", "display": "summarized"}),
+                    "{id}: {level:?}"
+                );
+                assert_eq!(
+                    body["output_config"],
+                    json!({"effort": effort}),
+                    "{id}: {level:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sonnet55_off_sends_between_tools() {
+        // `/thinking off` with a temperature set. Sonnet 5.5 answers
+        // `disabled` with a 400, its lowest setting is the thinking type
+        // `between_tools`, taken from the "off" entry of its level map.
+        // Three more 400s this body must avoid, any field next to the
+        // type (`display` too), an effort above high (no output_config
+        // means the API default, high), and a non default temperature.
+        let options = StreamOptions {
+            temperature: Some(0.2),
+            ..StreamOptions::default()
+        };
+        let sonnet = catalog_model("claude-sonnet-5-5");
+        let body = body_for(&sonnet, &options);
+        assert_eq!(body["thinking"], json!({"type": "between_tools"}));
+        assert!(body.get("output_config").is_none(), "{body}");
+        assert!(body.get("temperature").is_none(), "{body}");
+    }
+
+    #[test]
+    fn haiku55_off_disables_thinking_without_temperature() {
+        // Unlike Sonnet 5.5, Haiku accepts `disabled`, not `between_tools`.
+        // No effort override leaves the API default (medium), safely below
+        // the xhigh/max efforts that reject disabled thinking.
+        let haiku = catalog_model("claude-haiku-5-5");
+        let body = body_for(
+            &haiku,
+            &StreamOptions {
+                temperature: Some(0.2),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(body.get("output_config").is_none(), "{body}");
+        assert!(body.get("temperature").is_none(), "{body}");
+    }
+
+    #[test]
+    fn sonnet55_and_haiku55_levels_map_to_adaptive_effort() {
+        // Both models reject `budget_tokens` and need summarized display
+        // plus preserved thinking controls, like Opus 5.5.
+        for id in ["claude-sonnet-5-5", "claude-haiku-5-5"] {
+            let model = catalog_model(id);
+            for (level, effort) in [
+                // No "minimal" effort upstream, the map's null entry falls
+                // back to the provider default, which is "low".
+                (ThinkingLevel::Minimal, "low"),
+                (ThinkingLevel::Low, "low"),
+                (ThinkingLevel::Medium, "medium"),
+                (ThinkingLevel::High, "high"),
+                (ThinkingLevel::XHigh, "xhigh"),
+                (ThinkingLevel::Max, "max"),
+            ] {
+                let options = StreamOptions {
+                    reasoning: Some(level),
+                    temperature: Some(0.2),
+                    ..StreamOptions::default()
+                };
+                let body = body_for(&model, &options);
+                assert_eq!(
+                    body["thinking"],
+                    json!({
+                        "type": "adaptive",
+                        "display": "summarized",
+                        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+                    }),
+                    "{id} {level:?}"
+                );
+                assert_eq!(
+                    body["output_config"],
+                    json!({"effort": effort}),
+                    "{id} {level:?}"
+                );
+                assert!(body.get("temperature").is_none(), "{id}: {body}");
+            }
+        }
+    }
+
+    #[test]
+    fn preserved_thinking_binds_adaptive_requests_only() {
+        // Opus 5.5, Sonnet 5.5 and Haiku 5.5 run the preserved thinking check.
+        // Their adaptive requests ask the API to drop blocks that a history
+        // edit invalidated, plus the beta header that field needs (the field
+        // without the header is a 400 of its own).
+        let medium = StreamOptions {
+            reasoning: Some(ThinkingLevel::Medium),
+            ..StreamOptions::default()
+        };
+        for id in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"] {
+            let model = catalog_model(id);
+            let body = body_for(&model, &medium);
+            assert_eq!(
+                body["thinking"]["block_binding"],
+                json!({"prefix_mismatch_behavior": "drop_block"}),
+                "{id}"
+            );
+            let betas = request_betas(&anthropic_compat(&model), &hello(), &body);
+            assert!(betas.contains(&THINKING_BINDING_BETA), "{id}: {betas:?}");
+            assert_eq!(betas, vec![THINKING_BINDING_BETA], "{id}");
+        }
+
+        // Off never carries it, `between_tools` and `disabled` reject the
+        // field, and omitted `thinking` has no object to put it in. No
+        // field, no header, the agent loop covers these requests.
+        for id in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"] {
+            let model = catalog_model(id);
+            let body = body_for(&model, &StreamOptions::default());
+            assert!(body.pointer("/thinking/block_binding").is_none(), "{id}");
+            let betas = request_betas(&anthropic_compat(&model), &hello(), &body);
+            assert!(!betas.contains(&THINKING_BINDING_BETA), "{id}: {betas:?}");
+        }
+
+        // Models without the check keep their plain adaptive request.
+        let sonnet5 = catalog_model("claude-sonnet-5");
+        let body = body_for(&sonnet5, &medium);
+        assert!(body.pointer("/thinking/block_binding").is_none(), "{body}");
+    }
+}

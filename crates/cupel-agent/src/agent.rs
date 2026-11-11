@@ -1,0 +1,693 @@
+//! Stateful wrapper around the low level agent loop.
+//!
+//! Concurrency model, the run executes on a spawned Tokio task, so
+//! everything the run touches lives behind `Arc`s. State sits in
+//! `Arc<Mutex<...>>` with short lock scopes, the queues likewise. `prompt`
+//! hands back an [`AgentEventStream`]. The caller consumes events at its
+//! own pace while the internal forwarder keeps [`AgentState`] up to date.
+
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use futures_util::StreamExt as _;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
+
+use cupel_core::{
+    provider::Registry,
+    types::{Message, Model, StopReason, ThinkingLevel},
+};
+
+use crate::agent_loop::{AgentEventSink, AgentEventStream, agent_event_channel, agent_loop};
+use crate::types::{
+    AgentContext, AgentEvent, AgentHooks, AgentLoopConfig, AgentMessage, AgentTool, NoHooks,
+    RetryConfig, ToolExecutionMode,
+};
+
+/// Snapshot of the agent's public state. Cheap to clone except `messages`.
+#[derive(Clone)]
+pub struct AgentState {
+    pub system_prompt: String,
+    pub model: Model,
+    pub thinking_level: Option<ThinkingLevel>,
+    pub messages: Vec<AgentMessage>,
+    pub is_streaming: bool,
+    pub pending_tool_calls: HashSet<String>,
+    pub error_message: Option<String>,
+}
+
+pub struct AgentOptions {
+    pub system_prompt: String,
+    pub model: Model,
+    pub thinking_level: Option<ThinkingLevel>,
+    pub tools: Vec<Arc<dyn AgentTool>>,
+    pub hooks: Arc<dyn AgentHooks>,
+    pub registry: Arc<Registry>,
+    pub api_key: Option<String>,
+    pub session_id: Option<String>,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u64>,
+    pub tool_execution: ToolExecutionMode,
+    pub tool_gate: Option<Arc<dyn crate::ToolExecutionGate>>,
+    pub retry: RetryConfig,
+    pub compaction: crate::compaction::CompactionConfig,
+    pub messages: Vec<AgentMessage>,
+}
+
+impl AgentOptions {
+    #[must_use]
+    pub fn new(model: Model, registry: Arc<Registry>) -> Self {
+        Self {
+            system_prompt: String::new(),
+            model,
+            thinking_level: None,
+            tools: Vec::new(),
+            hooks: Arc::new(NoHooks),
+            registry,
+            api_key: None,
+            session_id: None,
+            temperature: None,
+            max_tokens: None,
+            tool_execution: ToolExecutionMode::default(),
+            tool_gate: None,
+            retry: RetryConfig::default(),
+            compaction: crate::compaction::CompactionConfig::default(),
+            messages: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgentError {
+    #[error(
+        "agent is already processing a prompt; use follow_up() to queue a message, or wait for completion"
+    )]
+    Busy,
+}
+
+pub struct Agent {
+    state: Arc<Mutex<AgentState>>,
+    tools: Vec<Arc<dyn AgentTool>>,
+    follow_ups: Arc<Mutex<VecDeque<AgentMessage>>>,
+    steering: Arc<Mutex<Vec<AgentMessage>>>,
+    steering_signal: Arc<Notify>,
+    hooks: Arc<dyn AgentHooks>,
+    registry: Arc<Registry>,
+    api_key: Option<String>,
+    session_id: Option<String>,
+    temperature: Option<f64>,
+    max_tokens: Option<u64>,
+    tool_execution: ToolExecutionMode,
+    tool_gate: Option<Arc<dyn crate::ToolExecutionGate>>,
+    retry: RetryConfig,
+    compaction: crate::compaction::CompactionConfig,
+    unverified_usage: Arc<AtomicBool>,
+    active: Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
+}
+
+impl Agent {
+    #[must_use]
+    pub fn new(options: AgentOptions) -> Self {
+        let unverified_usage = Arc::new(AtomicBool::new(!options.messages.is_empty()));
+        Self {
+            state: Arc::new(Mutex::new(AgentState {
+                system_prompt: options.system_prompt,
+                model: options.model,
+                thinking_level: options.thinking_level,
+                messages: options.messages,
+                is_streaming: false,
+                pending_tool_calls: HashSet::new(),
+                error_message: None,
+            })),
+            tools: options.tools,
+            follow_ups: Arc::new(Mutex::new(VecDeque::new())),
+            steering: Arc::new(Mutex::new(Vec::new())),
+            steering_signal: Arc::new(Notify::new()),
+            hooks: options.hooks,
+            registry: options.registry,
+            api_key: options.api_key,
+            session_id: options.session_id,
+            temperature: options.temperature,
+            max_tokens: options.max_tokens,
+            tool_execution: options.tool_execution,
+            tool_gate: options.tool_gate,
+            retry: options.retry,
+            compaction: options.compaction,
+            unverified_usage,
+            active: None,
+        }
+    }
+
+    /// Configure local leaf-tool admission for the next run. Model inputs are unchanged.
+    pub fn set_tool_gate(&mut self, gate: Option<Arc<dyn crate::ToolExecutionGate>>) {
+        self.tool_gate = gate;
+    }
+
+    /// Restore legacy application records as local-only data without changing usage anchors.
+    pub fn promote_custom_metadata(&self, kinds: &[&str]) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_error| "agent state lock poisoned while restoring metadata")?;
+        for message in &mut state.messages {
+            if let AgentMessage::Custom {
+                kind,
+                payload,
+                timestamp,
+            } = message
+                && kinds.contains(&kind.as_str())
+            {
+                *message = AgentMessage::metadata(std::mem::take(kind), payload.take(), *timestamp);
+            }
+        }
+        Ok(())
+    }
+
+    /// Snapshot of the current state.
+    #[must_use]
+    pub fn state(&self) -> AgentState {
+        self.state
+            .lock()
+            .expect("agent state lock poisoned")
+            .clone()
+    }
+
+    /// Switch the model for future requests (an in flight run keeps the
+    /// model it started with, the next run picks this up).
+    pub fn set_model(&self, model: Model) {
+        self.state.lock().expect("agent state lock poisoned").model = model;
+    }
+
+    /// Replace the system prompt for runs (the TUI's /preset
+    /// appends a preset prompt to the base prompt). Like set_model, a run
+    /// in flight keeps the prompt it started with, `prompt` copies it
+    /// into the run's context at the start.
+    pub fn set_system_prompt(&self, system_prompt: String) {
+        self.state
+            .lock()
+            .expect("agent state lock poisoned")
+            .system_prompt = system_prompt;
+    }
+
+    /// Swap the fallback API key used by future runs (the TUI's /provider
+    /// and cross provider /model switches). A run already in flight keeps
+    /// the key it was started with, hook provided keys still win.
+    pub fn set_api_key(&mut self, api_key: Option<String>) {
+        self.api_key = api_key;
+    }
+
+    #[must_use]
+    pub fn tools(&self) -> &[Arc<dyn AgentTool>] {
+        &self.tools
+    }
+
+    #[must_use]
+    pub fn hooks(&self) -> Arc<dyn AgentHooks> {
+        Arc::clone(&self.hooks)
+    }
+
+    pub fn set_hooks(&mut self, hooks: Arc<dyn AgentHooks>) {
+        self.hooks = hooks;
+    }
+
+    /// Changes apply to the next run and invalidate the prior usage anchor.
+    pub fn set_tools(&mut self, tools: Vec<Arc<dyn AgentTool>>) {
+        self.tools = tools;
+        self.unverified_usage.store(true, Ordering::SeqCst);
+    }
+
+    /// The fallback API key future runs will use. This is the read half of
+    /// `set_api_key`, so frontends and tests can verify which
+    /// credential a reload or switch resolved without sending a request.
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    /// The provider registry this agent dispatches through. Cheap (Arc
+    /// clone), letting a frontend rebuild an agent for the TUI's /hot reload
+    /// without re plumbing the registry from startup.
+    #[must_use]
+    pub fn registry(&self) -> Arc<Registry> {
+        Arc::clone(&self.registry)
+    }
+
+    /// One line describung a tool call for a UI. The tool's own
+    /// `describe_call` or just the name for a tool the agent does not have.
+    #[must_use]
+    pub fn describe_tool_call(&self, name: &str, args: &serde_json::Value) -> String {
+        self.tools
+            .iter()
+            .find(|tool| tool.name() == name)
+            .map_or_else(|| name.to_string(), |tool| tool.describe_call(args))
+    }
+
+    /// Set the thinking level for future requests (`None` = off).
+    pub fn set_thinking_level(&self, level: Option<ThinkingLevel>) {
+        self.state
+            .lock()
+            .expect("agent state lock poisoned")
+            .thinking_level = level;
+    }
+
+    /// The thinking level future runs will use. This is the read half of
+    /// `set_thinking_level`, for status displays. A cheap
+    /// copy read under the lock, deliberately not a full state()
+    /// snapshot (which clones the message history).
+    #[must_use]
+    pub fn thinking_level(&self) -> Option<ThinkingLevel> {
+        self.state
+            .lock()
+            .expect("agent state lock poisoned")
+            .thinking_level
+    }
+
+    /// The thinking level the next request really uses, the requested one,
+    /// except "off" on a model that cannot turn reasoning off, which gets its
+    /// lowest level instead.
+    #[must_use]
+    pub fn effective_thinking_level(&self) -> Option<ThinkingLevel> {
+        let state = self.state.lock().expect("agent state lock poisoned");
+        cupel_core::model::effective_thinking_level(&state.model, state.thinking_level)
+    }
+
+    /// The current model's context window.
+    #[must_use]
+    pub fn context_window(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("agent state lock poisoned")
+            .model
+            .context_window
+    }
+
+    /// The current model's optional ceiling, which may exceed its planning window.
+    #[must_use]
+    pub fn max_context_window(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .expect("agent state lock poisoned")
+            .model
+            .max_context_window
+    }
+
+    /// Whether discovery supplied an assumed context window rather than a known limit.
+    #[must_use]
+    pub fn context_window_is_assumed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("agent state lock poisoned")
+            .model
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.get("contextWindowAssumed"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    /// Whether the current model supports reasoning at all.
+    #[must_use]
+    pub fn model_supports_reasoning(&self) -> bool {
+        self.state
+            .lock()
+            .expect("agent state lock poisoned")
+            .model
+            .reasoning
+    }
+
+    pub fn reset(&self) {
+        {
+            let mut state = self.state.lock().expect("agent state lock poisoned");
+            state.messages.clear();
+            state.error_message = None;
+        }
+        self.unverified_usage.store(false, Ordering::SeqCst);
+    }
+
+    /// Append an external exchange between runs for the next request.
+    pub fn push_message(&self, message: AgentMessage) {
+        self.state
+            .lock()
+            .expect("agent state lock poisoned")
+            .messages
+            .push(message);
+    }
+
+    /// Restore a model-visible handoff between runs at its durable history position.
+    /// Insertion changes inference history, so old provider usage must be rechecked.
+    pub fn insert_message(&self, index: usize, message: AgentMessage) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_error| "agent state lock poisoned while restoring history")?;
+        if index > state.messages.len() {
+            return Err("restored message index exceeds history length".into());
+        }
+        state.messages.insert(index, message);
+        self.unverified_usage.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Queue a message to run once the agent would otherwise stop.
+    /// Meant to be called while a run is active. The loop takes one
+    /// queued message each time the model has finished, so every
+    /// message gets its own complete answer.
+    pub fn follow_up(&self, message: AgentMessage) {
+        self.follow_ups
+            .lock()
+            .expect("follow-up queue lock poisoned")
+            .push_back(message);
+    }
+
+    /// Take the oldest queued follow up out of the queue. A run can end
+    /// with messages still waiting. Queued after the loop's last look at
+    /// the queue, or behind a run that ended in an error. A frontend then
+    /// starts the next run with this message.
+    #[must_use]
+    pub fn take_follow_up(&self) -> Option<AgentMessage> {
+        self.follow_ups
+            .lock()
+            .expect("follow-up queue lock poisoned")
+            .pop_front()
+    }
+
+    /// Drop every queued follow up. The user took the queued prompts back
+    /// into the editor.
+    pub fn clear_follow_ups(&self) {
+        self.follow_ups
+            .lock()
+            .expect("follow-up queue lock poisoned")
+            .clear();
+    }
+
+    /// Steer the active run. The message goes in before the model's next request, and
+    /// a reply that is streaming right now is cut short so that request comes at once.
+    /// Tools that are already running finish first. Unlike a follow up, every waiting
+    /// steering message is delivered at the same moment.
+    pub fn steer(&self, message: AgentMessage) {
+        self.steering
+            .lock()
+            .expect("steering queue lock poisoned")
+            .push(message);
+        // notify_one stores a permit when nobody is waiting right now, so a message
+        // that arrives just before the next reply starts streaming still interrupts
+        // it.
+        self.steering_signal.notify_one();
+    }
+
+    /// Take every waiting steering message out of the queue. Like follow ups, they can
+    /// outlive a run that ended before the loop looked at them. A frontend then starts
+    /// the next run with them.
+    #[must_use]
+    pub fn take_steering(&self) -> Vec<AgentMessage> {
+        core::mem::take(&mut *self.steering.lock().expect("steering queue lock poisoned"))
+    }
+
+    /// Drop every waiting steering message. The user took the prompts back into the
+    /// editor.
+    pub fn clear_steering(&self) {
+        self.steering
+            .lock()
+            .expect("steering queue lock poisoned")
+            .clear();
+    }
+
+    /// Cancellation token of the active run, if any (e.g. for a Ctrl C
+    /// handler).
+    #[must_use]
+    pub fn cancel_token(&self) -> Option<CancellationToken> {
+        self.active.as_ref().map(|(token, _)| token.clone())
+    }
+
+    /// Abort the current run, if one is active.
+    pub fn abort(&self) {
+        if let Some((token, _)) = &self.active {
+            token.cancel();
+        }
+    }
+
+    /// Wait until the active run (if any) has fully finished.
+    pub async fn wait_for_idle(&mut self) {
+        if let Some((_, handle)) = self.active.take() {
+            let _ = handle.await;
+        }
+    }
+
+    /// Start a run with a plain text prompt.
+    ///
+    /// Returns the run's event stream. Consume it (or drop it, since state still
+    /// updates) and call `wait_for_idle` before the next prompt.
+    pub fn prompt_text(&mut self, text: impl Into<String>) -> Result<AgentEventStream, AgentError> {
+        self.prompt(vec![AgentMessage::user_text(text)])
+    }
+
+    /// Start a run with prepared prompt messages.
+    pub fn prompt(&mut self, prompts: Vec<AgentMessage>) -> Result<AgentEventStream, AgentError> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|(_, handle)| !handle.is_finished())
+        {
+            return Err(AgentError::Busy);
+        }
+
+        let (public_stream, public_sink) = agent_event_channel();
+        let (internal_stream, internal_sink) = agent_event_channel();
+        let cancel = CancellationToken::new();
+
+        // Snapshot everything the run needs.
+        let (context, config) = {
+            let state = self.state.lock().expect("agent state lock poisoned");
+            let mut messages = state.messages.clone();
+            if self.unverified_usage.load(Ordering::SeqCst) {
+                crate::compaction::invalidate_usage_anchors(&mut messages);
+            }
+            (
+                AgentContext {
+                    system_prompt: state.system_prompt.clone(),
+                    messages,
+                    tools: self.tools.clone(),
+                },
+                AgentLoopConfig {
+                    model: state.model.clone(),
+                    // The run uses what the model can do, the state keeps
+                    // what was asked for, so a later model switch can honour it.
+                    thinking_level: cupel_core::model::effective_thinking_level(
+                        &state.model,
+                        state.thinking_level,
+                    ),
+                    api_key: self.api_key.clone(),
+                    session_id: self.session_id.clone(),
+                    temperature: self.temperature,
+                    max_tokens: self.max_tokens,
+                    tool_execution: self.tool_execution,
+                    tool_gate: self.tool_gate.clone(),
+                    retry: self.retry,
+                    compaction: self.compaction,
+                },
+            )
+        };
+
+        // The run's hooks = user hooks + our queue draining.
+        let hooks: Arc<dyn AgentHooks> = Arc::new(RunHooks {
+            inner: Arc::clone(&self.hooks),
+            follow_ups: Arc::clone(&self.follow_ups),
+            steering: Arc::clone(&self.steering),
+            steering_signal: Arc::clone(&self.steering_signal),
+        });
+        let registry = Arc::clone(&self.registry);
+
+        {
+            let mut state = self.state.lock().expect("agent state lock poisoned");
+            state.is_streaming = true;
+            state.error_message = None;
+        }
+
+        // Task 1, the loop itself, emitting into the internal channel.
+        let loop_cancel = cancel.clone();
+        tokio::spawn(async move {
+            let _ = agent_loop(
+                prompts,
+                context,
+                config,
+                hooks,
+                registry,
+                loop_cancel,
+                internal_sink,
+            )
+            .await;
+        });
+
+        // Task 2, the forwarder reduces every event into AgentState,
+        // then re emits it to the caller.
+        let state = Arc::clone(&self.state);
+        let unverified_usage = Arc::clone(&self.unverified_usage);
+        let handle = tokio::spawn(async move {
+            forward_events(internal_stream, &state, &unverified_usage, &public_sink).await;
+            let mut state = state.lock().expect("agent state lock poisoned");
+            state.is_streaming = false;
+            state.pending_tool_calls.clear();
+        });
+
+        self.active = Some((cancel, handle));
+        Ok(public_stream)
+    }
+}
+
+/// Reduce loop events into shared state, then forward them.
+async fn forward_events(
+    mut events: AgentEventStream,
+    state: &Arc<Mutex<AgentState>>,
+    unverified_usage: &AtomicBool,
+    sink: &AgentEventSink,
+) {
+    while let Some(event) = events.next().await {
+        {
+            let mut state = state.lock().expect("agent state lock poisoned");
+            match &event {
+                AgentEvent::MessageEnd { message } => {
+                    if reports_context_size(message) {
+                        unverified_usage.store(false, Ordering::SeqCst);
+                    }
+                    state.messages.push(message.clone());
+                }
+                AgentEvent::CompactionEnd { messages, .. }
+                | AgentEvent::ThinkingBlocksRemoved { messages } => {
+                    state.messages.clone_from(messages);
+                }
+                AgentEvent::ToolExecutionStart { tool_call_id, .. } => {
+                    state.pending_tool_calls.insert(tool_call_id.clone());
+                }
+                AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
+                    state.pending_tool_calls.remove(tool_call_id);
+                }
+                AgentEvent::TurnEnd { message, .. } => {
+                    if let AgentMessage::Llm(Message::Assistant(assistant)) = message.as_ref()
+                        && let Some(error) = &assistant.error_message
+                    {
+                        state.error_message = Some(error.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        sink.emit(event);
+    }
+}
+
+/// A successful reply with provider usage measures the context this agent
+/// actually sent. Same test as the usage anchor in
+/// `estimate_context_tokens`.
+fn reports_context_size(message: &AgentMessage) -> bool {
+    let AgentMessage::Llm(Message::Assistant(assistant)) = message else {
+        return false;
+    };
+    if matches!(
+        assistant.stop_reason,
+        StopReason::Error | StopReason::Aborted
+    ) {
+        return false;
+    }
+    let usage = &assistant.usage;
+    usage.total_tokens > 0 || usage.input + usage.output + usage.cache_read + usage.cache_write > 0
+}
+
+/// Hook decorator that adds the Agent's queue draining on top of user hooks.
+struct RunHooks {
+    inner: Arc<dyn AgentHooks>,
+    follow_ups: Arc<Mutex<VecDeque<AgentMessage>>>,
+    steering: Arc<Mutex<Vec<AgentMessage>>>,
+    steering_signal: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl AgentHooks for RunHooks {
+    async fn on_user_messages(&self, messages: &[AgentMessage]) {
+        self.inner.on_user_messages(messages).await;
+    }
+
+    async fn model_request_problem(&self) -> Option<String> {
+        self.inner.model_request_problem().await
+    }
+    fn cancellation_token(&self) -> Option<CancellationToken> {
+        self.inner.cancellation_token()
+    }
+    async fn observe_usage(&self, usage: Option<&cupel_core::types::Usage>) {
+        self.inner.observe_usage(usage).await;
+    }
+    async fn request_messages(&self) -> Vec<AgentMessage> {
+        self.inner.request_messages().await
+    }
+
+    async fn convert_to_llm(&self, messages: &[AgentMessage]) -> Vec<Message> {
+        self.inner.convert_to_llm(messages).await
+    }
+
+    async fn transform_context(&self, messages: Vec<AgentMessage>) -> Vec<AgentMessage> {
+        self.inner.transform_context(messages).await
+    }
+
+    async fn api_key(&self, provider: &str) -> Option<String> {
+        self.inner.api_key(provider).await
+    }
+
+    async fn before_tool_call(
+        &self,
+        assistant: &cupel_core::types::AssistantMessage,
+        tool_call: &cupel_core::types::ToolCall,
+    ) -> Option<crate::types::BeforeToolCallResult> {
+        self.inner.before_tool_call(assistant, tool_call).await
+    }
+
+    async fn should_stop_after_turn(
+        &self,
+        message: &cupel_core::types::AssistantMessage,
+        tool_results: &[cupel_core::types::ToolResultMessage],
+    ) -> bool {
+        self.inner
+            .should_stop_after_turn(message, tool_results)
+            .await
+    }
+
+    async fn follow_up_messages(&self) -> Vec<AgentMessage> {
+        let mut messages = self.inner.follow_up_messages().await;
+        messages.extend(
+            self.follow_ups
+                .lock()
+                .expect("follow-up queue lock poisoned")
+                .pop_front(),
+        );
+        messages
+    }
+
+    async fn steering_messages(&self) -> Vec<AgentMessage> {
+        let mut messages = self.inner.steering_messages().await;
+        messages.append(&mut self.steering.lock().expect("steering queue lock poisoned"));
+        messages
+    }
+
+    async fn steering_arrived(&self) {
+        let own = async {
+            loop {
+                self.steering_signal.notified().await;
+                // A permit can be older than the queue's last drain. The message it
+                // announced went out at a turn boundary already. Only a waiting
+                // message is worth an interruption.
+                let waiting = !self
+                    .steering
+                    .lock()
+                    .expect("steering queue lock poisoned")
+                    .is_empty();
+                if waiting {
+                    return;
+                }
+            }
+        };
+        // Whichever source has something first.
+        tokio::select! {
+            () = own => {}
+            () = self.inner.steering_arrived() => {}
+        }
+    }
+}

@@ -1,0 +1,464 @@
+//! The `read` tool.
+//!
+//! Text files stream back with head truncation (2000 lines / 50 KB) and
+//! *actionable* continuation notices. "use offset=N to continue" teaches
+//! the model how to page through big files instead of giving up. Images are
+//! detected by extension, checked for matching signatures and a 4 MiB size
+//! limit, and returned as base64 attachments, the core
+//! transform layer already downgrades them to a text placeholder for models
+//! without vision, so the tool doesn't need to know the active model.
+
+use std::path::PathBuf;
+
+use base64::Engine as _;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::io::AsyncReadExt as _;
+use tokio_util::sync::CancellationToken;
+
+use cupel_agent::types::{AgentTool, AgentToolResult, ToolError, ToolUpdateFn};
+use cupel_core::types::{ImageContent, TextContent, ToolResultContent};
+
+use crate::search::resolve_to_root;
+use crate::truncate::{
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, TruncationOptions, format_size,
+    truncate_head,
+};
+
+// Leave headroom below providers' per image limits (Anthropic, 5 MiB).
+const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadArgs {
+    path: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+/// Map a file extension to a provider supported image MIME type.
+fn image_mime_type(path: &std::path::Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Recognize the full magic signature, not just a filename or partial prefix.
+fn image_mime_type_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', ..] => Some("image/png"),
+        [0xff, 0xd8, 0xff, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', b'7' | b'9', b'a', ..] => Some("image/gif"),
+        bytes if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") => {
+            Some("image/webp")
+        }
+        _ => None,
+    }
+}
+
+fn image_size_error(path: &str, size: u64) -> Option<String> {
+    (size > MAX_IMAGE_BYTES as u64).then(|| {
+        format!(
+            "Image file {path} is too large ({size} bytes; limit: {}). \
+             Resize or compress the image before reading it.",
+            format_size(MAX_IMAGE_BYTES)
+        )
+    })
+}
+
+pub struct ReadTool {
+    cwd: PathBuf,
+    description: String,
+}
+
+impl ReadTool {
+    #[must_use]
+    pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            description: format!(
+                "Read the contents of a file. Supports text files and images (jpg, png, gif, \
+                 webp). Images up to 4 MiB with matching file signatures are sent as \
+                 attachments; resize or compress larger images first. For text files, output \
+                 is truncated to \
+                 {DEFAULT_MAX_LINES} lines or {}KB (whichever is hit first). Use offset/limit \
+                 for large files. When you need the full file, continue with offset until \
+                 complete.",
+                DEFAULT_MAX_BYTES / 1024
+            ),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTool for ReadTool {
+    fn name(&self) -> &str {
+        "read"
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to read (relative or absolute)"
+                },
+                "offset": {
+                    "type": "number",
+                    "description": "Line number to start reading from (1-indexed)"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Maximum number of lines to read"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    /// `read <path>` plus the requested line range.
+    fn describe_call(&self, args: &Value) -> String {
+        let Some(path) = args.get("path").and_then(Value::as_str) else {
+            return self.name().to_string();
+        };
+        let offset = args.get("offset").and_then(Value::as_u64);
+        let limit = args.get("limit").and_then(Value::as_u64);
+        if offset.is_none() && limit.is_none() {
+            return format!("read {path}");
+        }
+        let start = offset.unwrap_or(1);
+
+        match limit {
+            Some(limit) => format!("read {path}:{start}-{}", (start + limit).saturating_sub(1)),
+            None => format!("read {path}:{start}"),
+        }
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        args: Value,
+        cancel: CancellationToken,
+        _on_update: Option<ToolUpdateFn>,
+    ) -> Result<AgentToolResult, ToolError> {
+        let args: ReadArgs = serde_json::from_value(args)?;
+        let absolute_path = resolve_to_root(&args.path, &self.cwd);
+
+        if cancel.is_cancelled() {
+            return Err("Operation aborted".into());
+        }
+
+        if let Some(mime_type) = image_mime_type(&absolute_path) {
+            let file = tokio::fs::File::open(&absolute_path)
+                .await
+                .map_err(|e| format!("Could not read image file: {} ({e})", args.path))?;
+            let metadata = file
+                .metadata()
+                .await
+                .map_err(|e| format!("Could not inspect image file: {} ({e})", args.path))?;
+            if let Some(error) = image_size_error(&args.path, metadata.len()) {
+                return Err(error.into());
+            }
+
+            // Bound the read as well, in case the file grows after the metadata check.
+            let mut bytes = Vec::new();
+            file.take(MAX_IMAGE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|e| format!("Could not read image file: {} ({e})", args.path))?;
+            if let Some(error) = image_size_error(&args.path, bytes.len() as u64) {
+                return Err(error.into());
+            }
+            if cancel.is_cancelled() {
+                return Err("Operation aborted".into());
+            }
+            if image_mime_type_from_bytes(&bytes) != Some(mime_type) {
+                return Err(format!(
+                    "Could not read image file: {} (file signature does not match {mime_type}). \
+                     Use a valid PNG, JPEG, GIF or WEBP image with the matching extension.",
+                    args.path
+                )
+                .into());
+            }
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            return Ok(AgentToolResult {
+                content: vec![
+                    ToolResultContent::Text(TextContent::plain(format!(
+                        "Read image file [{mime_type}]"
+                    ))),
+                    ToolResultContent::Image(ImageContent {
+                        data,
+                        mime_type: mime_type.to_string(),
+                    }),
+                ],
+                details: None,
+                terminate: false,
+            });
+        }
+
+        let content = tokio::fs::read_to_string(&absolute_path)
+            .await
+            .map_err(|e| format!("Could not read file: {} ({e})", args.path))?;
+        if cancel.is_cancelled() {
+            return Err("Operation aborted".into());
+        }
+
+        let all_lines: Vec<&str> = content.split('\n').collect();
+        let total_file_lines = all_lines.len();
+
+        let start_line = args.offset.map_or(0, |o| o.saturating_sub(1));
+        let start_line_display = start_line + 1;
+        if start_line >= all_lines.len() {
+            return Err(format!(
+                "Offset {} is beyond end of file ({total_file_lines} lines total)",
+                args.offset.unwrap_or(0)
+            )
+            .into());
+        }
+
+        // A user provided limit is honored first, truncate_head still applies
+        // its own line/byte caps afterwards.
+        let (selected, user_limited_lines) = match args.limit {
+            Some(limit) => {
+                let end = (start_line + limit).min(all_lines.len());
+                (
+                    all_lines[start_line..end].join("\n"),
+                    Some(end - start_line),
+                )
+            }
+            None => (all_lines[start_line..].join("\n"), None),
+        };
+
+        let truncation = truncate_head(&selected, TruncationOptions::default());
+        let output = if truncation.first_line_exceeds_limit {
+            let first_line_size = format_size(all_lines[start_line].len());
+            format!(
+                "[Line {start_line_display} is {first_line_size}, exceeds {} limit. Use bash: \
+                 sed -n '{start_line_display}p' {} | head -c {DEFAULT_MAX_BYTES}]",
+                format_size(DEFAULT_MAX_BYTES),
+                args.path
+            )
+        } else if truncation.truncated {
+            let end_line_display = start_line_display + truncation.output_lines - 1;
+            let next_offset = end_line_display + 1;
+            let reason = if truncation.truncated_by == Some(TruncatedBy::Lines) {
+                format!(
+                    "Showing lines {start_line_display}-{end_line_display} of {total_file_lines}."
+                )
+            } else {
+                format!(
+                    "Showing lines {start_line_display}-{end_line_display} of \
+                     {total_file_lines} ({} limit).",
+                    format_size(DEFAULT_MAX_BYTES)
+                )
+            };
+            format!(
+                "{}\n\n[{reason} Use offset={next_offset} to continue.]",
+                truncation.content
+            )
+        } else if let Some(shown) =
+            user_limited_lines.filter(|shown| start_line + shown < all_lines.len())
+        {
+            // The user's limit stopped early but the file continues.
+            let remaining = all_lines.len() - (start_line + shown);
+            let next_offset = start_line + shown + 1;
+            format!(
+                "{}\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]",
+                truncation.content
+            )
+        } else {
+            truncation.content
+        };
+
+        Ok(AgentToolResult::text(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn run_read(dir: &std::path::Path, args: Value) -> Result<String, String> {
+        let tool = ReadTool::new(dir);
+        let result = tool
+            .execute("call_1", args, CancellationToken::new(), None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let ToolResultContent::Text(text) = &result.content[0] else {
+            return Err("expected text".to_string());
+        };
+        Ok(text.text.clone())
+    }
+
+    #[test]
+    fn describe_call_shows_the_line_range() {
+        let tool = ReadTool::new("/tmp");
+        assert_eq!(
+            tool.describe_call(&json!({"path": "src/lib.rs"})),
+            "read src/lib.rs"
+        );
+        assert_eq!(
+            tool.describe_call(&json!({"path": "src/lib.rs", "offset": 12, "limit": 69})),
+            "read src/lib.rs:12-80"
+        );
+        assert_eq!(
+            tool.describe_call(&json!({"path": "src/lib.rs", "limit": 20})),
+            "read src/lib.rs:1-20"
+        );
+        assert_eq!(
+            tool.describe_call(&json!({"path": "src/lib.rs", "offset": 200})),
+            "read src/lib.rs:200"
+        );
+        assert_eq!(tool.describe_call(&json!({})), "read");
+    }
+
+    #[tokio::test]
+    async fn reads_whole_file() {
+        let dir = std::env::temp_dir().join("cupel-read-test-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "one\ntwo\nthree").unwrap();
+        let out = run_read(&dir, json!({"path": "f.txt"})).await.unwrap();
+        assert_eq!(out, "one\ntwo\nthree");
+    }
+
+    #[tokio::test]
+    async fn offset_and_limit_add_continuation_notice() {
+        let dir = std::env::temp_dir().join("cupel-read-test-2");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "1\n2\n3\n4\n5").unwrap();
+        let out = run_read(&dir, json!({"path": "f.txt", "offset": 2, "limit": 2}))
+            .await
+            .unwrap();
+        assert!(out.starts_with("2\n3"), "got: {out}");
+        assert!(out.contains("Use offset=4 to continue"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn offset_beyond_eof_is_an_error() {
+        let dir = std::env::temp_dir().join("cupel-read-test-3");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "only line").unwrap();
+        let err = run_read(&dir, json!({"path": "f.txt", "offset": 10}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("beyond end of file"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn supported_images_are_returned_as_attachments() {
+        let dir = std::env::temp_dir().join(format!("cupel-read-images-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = ReadTool::new(&dir);
+        let cases: [(&str, &[u8], &str); 6] = [
+            ("p.PNG", b"\x89PNG\r\n\x1a\n", "image/png"),
+            ("p.jpg", b"\xff\xd8\xff", "image/jpeg"),
+            ("p.jpeg", b"\xff\xd8\xff", "image/jpeg"),
+            ("old.gif", b"GIF87a", "image/gif"),
+            ("new.gif", b"GIF89a", "image/gif"),
+            ("p.webp", b"RIFF\x04\x00\x00\x00WEBP", "image/webp"),
+        ];
+        for (path, bytes, mime_type) in cases {
+            std::fs::write(dir.join(path), bytes).unwrap();
+            let result = tool
+                .execute("c", json!({"path": path}), CancellationToken::new(), None)
+                .await
+                .unwrap();
+            assert_eq!(result.content.len(), 2);
+            let ToolResultContent::Image(image) = &result.content[1] else {
+                panic!("expected an image attachment for {path}");
+            };
+            assert_eq!(image.mime_type, mime_type);
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&image.data)
+                    .unwrap(),
+                bytes
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_or_mismatched_image_signatures_are_errors() {
+        let dir =
+            std::env::temp_dir().join(format!("cupel-read-invalid-images-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cases: [(&str, &[u8]); 10] = [
+            ("empty.png", b""),
+            ("text.png", b"not an image"),
+            ("partial.png", b"\x89PNG"),
+            ("wrong.png", b"\xff\xd8\xff"),
+            ("partial.jpg", b"\xff\xd8"),
+            ("wrong.jpeg", b"\x89PNG\r\n\x1a\n"),
+            ("wrong.gif", b"GIF88a"),
+            ("partial.webp", b"RIFF"),
+            ("audio.webp", b"RIFF\x04\x00\x00\x00WAVE"),
+            ("wrong.webp", b"NOPE\x04\x00\x00\x00WEBP"),
+        ];
+        for (path, bytes) in cases {
+            std::fs::write(dir.join(path), bytes).unwrap();
+            let err = run_read(&dir, json!({"path": path})).await.unwrap_err();
+            assert!(err.contains(path), "got: {err}");
+            assert!(err.contains("file signature does not match"), "got: {err}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_size_limit_accepts_boundary_and_rejects_larger_files() {
+        let dir =
+            std::env::temp_dir().join(format!("cupel-read-image-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("large.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(MAX_IMAGE_BYTES as u64).unwrap();
+
+        let tool = ReadTool::new(&dir);
+        let result = tool
+            .execute(
+                "c",
+                json!({"path": "large.png"}),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let ToolResultContent::Image(image) = &result.content[1] else {
+            panic!("expected an image attachment at the size limit");
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&image.data)
+                .unwrap()
+                .len(),
+            MAX_IMAGE_BYTES
+        );
+
+        for size in [MAX_IMAGE_BYTES as u64 + 1, 8 * 1024 * 1024] {
+            file.set_len(size).unwrap();
+            let err = run_read(&dir, json!({"path": "large.png"}))
+                .await
+                .unwrap_err();
+            assert!(err.contains("large.png"), "got: {err}");
+            assert!(err.contains("too large"), "got: {err}");
+            assert!(err.contains("Resize or compress"), "got: {err}");
+        }
+        drop(file);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

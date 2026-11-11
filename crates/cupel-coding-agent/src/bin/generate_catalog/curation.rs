@@ -1,0 +1,626 @@
+//! The curated built in catalog defines which models cupel ships, plus the
+//! cupel side knowledge models.dev does not carry, base URLs (missing
+//! upstream for anthropic/openai), the API family per model, compat
+//! quirks, and thinking map exceptions.
+//!
+//! Routine maintenance happens here, adding a model = one row in
+//! [`PROVIDERS`], then refresh the snapshot with
+//! the catalog generator with its fetch option.
+
+use cupel_core::types::{Api, Provider};
+
+pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
+
+pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+/// Empty on purpose, the AWS SDK derives the endpoint from the region
+/// (see build_client).
+pub const BEDROCK_BASE_URL: &str = "";
+/// Fireworks' Anthropic compatible endpoint (most of their models).
+pub const FIREWORKS_ANTHROPIC_BASE_URL: &str = "https://api.fireworks.ai/inference";
+/// Fireworks' Anthropic compatible endpoint (most of ther models).
+pub const FIREWORKS_COMPLETIONS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
+/// OpenRouter's OpenAI completions compatible endpoint
+pub const OPENROUTER_COMPLETIONS_BASE_URL: &str = "https://openrouter.ai/api/v1";
+/// The ChatGPT Codex backend (subscription auth, see cupel core's
+/// openai_codex + openai_codex_responses).
+pub const OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
+
+/// How a curated model's thinkingLevelMap is produced.
+pub enum Thinking {
+    Budget,
+    FromEffort,
+    Explicit(&'static [(&'static str, Option<&'static str>)]),
+}
+
+/// Where a curated model's context window come from.
+pub enum Window {
+    ModelsDev,
+    PriceTier,
+}
+
+/// Named compat templates for the per API quirk blobs from the old
+/// hand written catalog, now defined in exactly one place.
+pub enum Compat {
+    None,
+    FireworksAnthropic,
+    FireworksCompletions,
+    AdaptiveAnthropic,
+    PreservedThinkingAnthropic,
+    OpenrouterCompletions,
+}
+
+impl Compat {
+    pub fn to_value(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::None => None,
+            Self::FireworksAnthropic => Some(serde_json::json!({
+                "sendSessionAffinityHeaders": true,
+                "supportsEagerToolInputStreaming": false,
+                "supportsCacheControlOnTools": false,
+                "supportsLongCacheRetention": false,
+            })),
+            Self::FireworksCompletions => Some(serde_json::json!({
+                "supportsStore": false,
+                "supportsDeveloperRole": false,
+            })),
+            Self::AdaptiveAnthropic => Some(serde_json::json!({
+                "forceAdaptiveThinking": true,
+                "supportsTemperature": false,
+            })),
+            Self::PreservedThinkingAnthropic => Some(serde_json::json!({
+                "forceAdaptiveThinking": true,
+                "supportsTemperature": false,
+                "prefixMismatchBehavior": "drop_block",
+            })),
+            Self::OpenrouterCompletions => Some(serde_json::json!({
+                "thinkingFormat": "openrouter",
+                "supportsDeveloperRole": false,
+            })),
+        }
+    }
+}
+
+/// One curated model, the models.dev id (== cupel id) plus cupel side facts.
+pub struct Curated {
+    pub id: &'static str,
+    pub rename: Option<&'static str>,
+    pub api: &'static str,
+    pub base_url: &'static str,
+    pub thinking: Thinking,
+    pub compat: Compat,
+    pub window: Window,
+}
+
+pub struct CuratedProvider {
+    pub models_dev_id: &'static str,
+    pub cupel_id: &'static str,
+    pub models: &'static [Curated],
+}
+
+/// Kimi K2.7 Code on OpenRouter is always thinking.
+const KIMI_K27_CODE_OPENROUTER_THINKING: &[(&str, Option<&str>)] = &[("off", None)];
+
+/// Claude Sonnet 5.5 answers `thinking` with `type` set to `disabled` with a 400.
+/// Its lowest setting is the thinking type `between_tools`, no extended
+/// thinking, only short progress notes between tool calls. models.dev
+/// has no field for that, so the map is pinned here instead of derived
+/// from the effort list (which would give off → null, i.e. `thinking`
+/// left out and the model thinking adaptively at its default effort,
+/// high). "off" names the thinking type the provider sends (anthropic and
+/// bedrock), "minimal" has no effort upstream (null), and low..max keep
+/// their own names (no entry, see models_dev.rs for why xhigh/max must
+/// stay absent).
+const SONNET55_THINKING: &[(&str, Option<&str>)] =
+    &[("off", Some("between_tools")), ("minimal", None)];
+
+// Compact row constructors, one per model family, with the same shape the
+// old catalog.rs used (fireworks_anthropic / fireworks_glm52 helpers).
+
+/// Claude models that answer `budget_tokens` with a 400 (Sonnet 5,
+/// Opus 5, Opus 5.5, Fable 5/5.1), effort levels replace token budgets, and
+/// `temperature` is rejected too. The level map comes from models.dev's
+/// effort list, a model listed with a toggle keeps "off" (the provider
+/// sends `thinking` with `type` set to `disabled`), one without a toggle gets
+/// off → null (the provider leaves `thinking` out).
+const fn anthropic_adaptive(id: &'static str) -> Curated {
+    Curated {
+        id,
+        rename: None,
+        api: Api::ANTHROPIC_MESSAGES,
+        base_url: ANTHROPIC_BASE_URL,
+        thinking: Thinking::FromEffort,
+        compat: Compat::AdaptiveAnthropic,
+        window: Window::ModelsDev,
+    }
+}
+
+/// Adaptive Claude models that run the preserved thinking check (Opus 5.5,
+/// Sonnet 5.5, Haiku 5.5), a thinking block is only valid in the unchanged
+/// conversation that produced it. Accounts created on or after 2026 08 31
+/// get a 400 for a replayed block after an edit, and cupel edits history
+/// (compaction, the date line of a resumed session). "drop_block" makes
+/// the API drop such blocks instead, see the anthropic provider.
+const fn anthropic_preserved(id: &'static str) -> Curated {
+    Curated {
+        compat: Compat::PreservedThinkingAnthropic,
+        ..anthropic_adaptive(id)
+    }
+}
+
+const fn openai(id: &'static str, rename: Option<&'static str>) -> Curated {
+    Curated {
+        id,
+        rename,
+        api: Api::OPENAI_RESPONSES,
+        base_url: OPENAI_BASE_URL,
+        thinking: Thinking::FromEffort,
+        compat: Compat::None,
+        window: Window::PriceTier,
+    }
+}
+
+const fn bedrock(id: &'static str, rename: Option<&'static str>, thinking: Thinking) -> Curated {
+    Curated {
+        id,
+        rename,
+        api: Api::BEDROCK_CONVERSE_STREAM,
+        base_url: BEDROCK_BASE_URL,
+        thinking,
+        compat: Compat::None,
+        window: Window::ModelsDev,
+    }
+}
+
+/// Claude 5+ on Bedrock, the same adaptive compat as the Anthropic twin, so
+/// the Bedrock provider reads the model's capabilities from the catalog
+/// instead of guessing them from the id.
+const fn bedrock_adaptive(
+    id: &'static str,
+    rename: Option<&'static str>,
+    thinking: Thinking,
+) -> Curated {
+    Curated {
+        compat: Compat::AdaptiveAnthropic,
+        ..bedrock(id, rename, thinking)
+    }
+}
+
+const fn fireworks_anthropic(id: &'static str) -> Curated {
+    Curated {
+        id,
+        rename: None,
+        api: Api::ANTHROPIC_MESSAGES,
+        base_url: FIREWORKS_ANTHROPIC_BASE_URL,
+        thinking: Thinking::Budget,
+        compat: Compat::FireworksAnthropic,
+        window: Window::ModelsDev,
+    }
+}
+
+const fn fireworks_completions(id: &'static str, thinking: Thinking) -> Curated {
+    Curated {
+        id,
+        rename: None,
+        api: Api::OPENAI_COMPLETIONS,
+        base_url: FIREWORKS_COMPLETIONS_BASE_URL,
+        thinking,
+        compat: Compat::FireworksCompletions,
+        window: Window::ModelsDev,
+    }
+}
+
+const fn openrouter(id: &'static str, thinking: Thinking) -> Curated {
+    Curated {
+        id,
+        rename: None,
+        api: Api::OPENAI_COMPLETIONS,
+        base_url: OPENROUTER_COMPLETIONS_BASE_URL,
+        thinking,
+        compat: Compat::OpenrouterCompletions,
+        window: Window::ModelsDev,
+    }
+}
+
+/// Plan below the first long context price tier, retaining the full window
+/// as an explicit opt in. Applies to GPT 6 and other tier priced models.
+const fn openrouter_tiered(id: &'static str) -> Curated {
+    Curated {
+        window: Window::PriceTier,
+        ..openrouter(id, Thinking::FromEffort)
+    }
+}
+
+/// Table order = catalog order = /model and /provider order.
+///
+/// claude sonnet 5 must stay the very first row, test fixtures across
+/// the workspace use builtin_models().remove(0), and catalog_providers'
+/// per provder default is "first in catalog order". The generator's
+/// validate() enforces this.
+pub const PROVIDERS: &[CuratedProvider] = &[
+    CuratedProvider {
+        models_dev_id: "anthropic",
+        cupel_id: Provider::ANTHROPIC,
+        models: &[
+            anthropic_adaptive("claude-sonnet-5"),
+            // Struct update syntax, every field comes from the preserved
+            // template (compat, API, base URL), only `thinking` is replaced.
+            Curated {
+                thinking: Thinking::Explicit(SONNET55_THINKING),
+                ..anthropic_preserved("claude-sonnet-5-5")
+            },
+            anthropic_preserved("claude-opus-5-5"),
+            anthropic_adaptive("claude-opus-5"),
+            anthropic_adaptive("claude-fable-5"),
+            anthropic_adaptive("claude-fable-5-1"),
+            // Haiku accepts `disabled` (unlike Sonnet 5.5), so derive its
+            // map from the toggle/effort list. Plan below the 100k price
+            // boundary, the full 1M window remains an explicit opt in.
+            Curated {
+                window: Window::PriceTier,
+                ..anthropic_preserved("claude-haiku-5-5")
+            },
+        ],
+    },
+    CuratedProvider {
+        models_dev_id: "openai",
+        cupel_id: Provider::OPENAI,
+        models: &[
+            // First row = the `/provider openai` default.
+            // Unlike Sol and Luna, GPT 6.1 Sol has no "none" effort (OpenAI's
+            // model page, "none" and "minimal" are not supported). The
+            // derived map therefore gives off → null, and the provider
+            // leaves `reasoning` out, as it does for Astra.
+            openai("gpt-6.1-sol", None),
+            openai("gpt-6-astra", None),
+            openai("gpt-6.1-terra", None),
+            openai("gpt-6-luna", None),
+        ],
+    },
+    CuratedProvider {
+        models_dev_id: "amazon-bedrock",
+        cupel_id: Provider::AMAZON_BEDROCK,
+        models: &[
+            bedrock_adaptive(
+                "us.anthropic.claude-sonnet-5",
+                Some("Claude Sonnet 5 (Bedrock)"),
+                Thinking::FromEffort,
+            ),
+            // Sonnet 5.5's off switch is the same as on the Anthropic API.
+            bedrock_adaptive(
+                "global.anthropic.claude-sonnet-5-5",
+                Some("Claude Sonnet 5.5 (Bedrock)"),
+                Thinking::Explicit(SONNET55_THINKING),
+            ),
+            bedrock_adaptive(
+                "us.anthropic.claude-sonnet-5-5",
+                Some("Claude Sonnet 5.5 (Bedrock US)"),
+                Thinking::Explicit(SONNET55_THINKING),
+            ),
+            bedrock_adaptive(
+                "global.anthropic.claude-opus-5-5",
+                Some("Claude Opus 5.5 (Bedrock)"),
+                Thinking::FromEffort,
+            ),
+            bedrock_adaptive(
+                "us.anthropic.claude-opus-5",
+                Some("Claude Opus 5 (Bedrock)"),
+                Thinking::FromEffort,
+            ),
+            // Match the direct Haiku row's 100k planning window; the full
+            // 1M window remains opt in at the higher price tier.
+            Curated {
+                window: Window::PriceTier,
+                ..bedrock_adaptive(
+                    "global.anthropic.claude-haiku-5-5",
+                    Some("Claude Haiku 5.5 (Bedrock)"),
+                    Thinking::FromEffort,
+                )
+            },
+            bedrock_adaptive(
+                "us.anthropic.claude-fable-5",
+                Some("Claude Fable 5 (Bedrock)"),
+                Thinking::FromEffort,
+            ),
+            bedrock_adaptive(
+                "us.anthropic.claude-fable-5-1",
+                Some("Claude Fable 5.1 (Bedrock)"),
+                Thinking::FromEffort,
+            ),
+        ],
+    },
+    CuratedProvider {
+        models_dev_id: "fireworks-ai",
+        cupel_id: Provider::FIREWORKS,
+        models: &[
+            // First row = the `/provider fireworks` default.
+            fireworks_anthropic("accounts/fireworks/models/deepseek-v4p1-flash"),
+            fireworks_anthropic("accounts/fireworks/models/deepseek-v4p1-flash-1017"),
+            fireworks_anthropic("accounts/fireworks/routers/deepseek-flash-latest"),
+            fireworks_anthropic("accounts/fireworks/models/minimax-m3"),
+            // These models expose native effort scales through completions.
+            // Keep their independent OpenRouter rows too, limits can differ.
+            fireworks_completions(
+                "accounts/fireworks/models/minimax-m3p1-flash",
+                Thinking::FromEffort,
+            ),
+            fireworks_anthropic("accounts/fireworks/models/qwen3p8-max"),
+            fireworks_completions(
+                "accounts/fireworks/models/qwen3p8-2p4t-a95b",
+                Thinking::FromEffort,
+            ),
+            fireworks_anthropic("accounts/fireworks/models/kimi-k3"),
+            fireworks_anthropic("accounts/fireworks/routers/kimi-k3-fast"),
+            // Fireworks' own model, built on Kimi K3 and trained to reason in
+            // fewer tokens, so it uses the same template as Kimi K3. Fireworks
+            // serves it as a Research Preview.
+            fireworks_anthropic("accounts/fireworks/models/ember-1"),
+            fireworks_anthropic("accounts/fireworks/models/inkling"),
+            fireworks_completions("accounts/fireworks/models/glm-5p3", Thinking::FromEffort),
+            // The fast router serves GLM 5.3 and lists the same effort scale.
+            fireworks_completions(
+                "accounts/fireworks/routers/glm-5p3-fast",
+                Thinking::FromEffort,
+            ),
+            fireworks_completions(
+                "accounts/fireworks/models/glm-5p3-flash",
+                Thinking::FromEffort,
+            ),
+            fireworks_completions(
+                "accounts/fireworks/models/muse-spark-open",
+                Thinking::FromEffort,
+            ),
+            // Spot is best-effort capacity, selected by model id (not
+            // service_tier). Keep it opt in, after the standard rows.
+            // https://docs.fireworks.ai/guides/spot-serverless
+            fireworks_completions(
+                "accounts/fireworks/routers/deepseek-v4p1-flash-spot",
+                Thinking::FromEffort,
+            ),
+            fireworks_completions(
+                "accounts/fireworks/routers/deepseek-v4p1-flash-1017-spot",
+                Thinking::FromEffort,
+            ),
+            fireworks_completions(
+                "accounts/fireworks/routers/glm-5p3-spot",
+                Thinking::FromEffort,
+            ),
+            fireworks_completions(
+                "accounts/fireworks/routers/kimi-k3-spot",
+                Thinking::FromEffort,
+            ),
+        ],
+    },
+    CuratedProvider {
+        models_dev_id: "openrouter",
+        cupel_id: Provider::OPENROUTER,
+        models: &[
+            openrouter("qwen/qwen3.8-max-0902", Thinking::FromEffort),
+            openrouter("qwen/qwen3.8-max-prime", Thinking::FromEffort),
+            openrouter("qwen/qwen3.8-2.4t-a95b", Thinking::FromEffort),
+            openrouter("qwen/qwen3.8-27b", Thinking::FromEffort),
+            openrouter("qwen/qwen3.8-flash", Thinking::FromEffort),
+            openrouter("qwen/qwen3.8-omni-flash", Thinking::FromEffort),
+            openrouter_tiered("qwen/qwen3.7-plus"),
+            openrouter("qwen/qwen3-coder-next", Thinking::FromEffort),
+            openrouter(
+                "moonshotai/kimi-k2.7-code",
+                Thinking::Explicit(KIMI_K27_CODE_OPENROUTER_THINKING),
+            ),
+            openrouter("moonshotai/kimi-k3", Thinking::FromEffort),
+            openrouter("moonshotai/kimi-k3.1-pro", Thinking::FromEffort),
+            openrouter("z-ai/glm-5.3", Thinking::FromEffort),
+            openrouter("z-ai/glm-5.3-prime", Thinking::FromEffort),
+            openrouter("z-ai/glm-5.3-flash", Thinking::FromEffort),
+            openrouter("z-ai/glm-5.3-flashx", Thinking::FromEffort),
+            openrouter("z-ai/glm-5.3-flashx-legal", Thinking::FromEffort),
+            openrouter("z-ai/glm-5v-turbo", Thinking::FromEffort),
+            openrouter("deepseek/deepseek-v4-pro", Thinking::FromEffort),
+            openrouter("deepseek/deepseek-v4-pro-0813", Thinking::FromEffort),
+            openrouter("deepseek/deepseek-v4-flash-0731", Thinking::FromEffort),
+            openrouter("deepseek/deepseek-v4.1-flash-1017", Thinking::FromEffort),
+            openrouter("x-ai/grok-4.6", Thinking::FromEffort),
+            openrouter("x-ai/grok-4.7", Thinking::FromEffort),
+            openrouter_tiered("x-ai/grok-build-0.1"),
+            openrouter("google/gemini-3.7-flash", Thinking::FromEffort),
+            openrouter("google/gemini-3.8-flash", Thinking::FromEffort),
+            openrouter("google/gemini-3.5-flash-lite", Thinking::FromEffort),
+            openrouter("google/gemini-4-argon", Thinking::FromEffort),
+            openrouter("google/gemma-4-31b-it", Thinking::FromEffort),
+            openrouter("google/gemma-4-31b-it:free", Thinking::FromEffort),
+            openrouter("google/gemma-4-26b-a4b-it", Thinking::FromEffort),
+            openrouter("google/gemma-4-26b-a4b-it:free", Thinking::FromEffort),
+            openrouter_tiered("openai/gpt-6-astra"),
+            openrouter_tiered("openai/gpt-6-astra-pro"),
+            openrouter_tiered("openai/gpt-6-sol"),
+            openrouter_tiered("openai/gpt-6-sol-pro"),
+            openrouter_tiered("openai/gpt-6.1-sol"),
+            openrouter_tiered("openai/gpt-6.1-sol-pro"),
+            openrouter_tiered("openai/gpt-6.1-terra"),
+            openrouter_tiered("openai/gpt-6.1-terra-pro"),
+            openrouter_tiered("openai/gpt-6-luna"),
+            openrouter_tiered("openai/gpt-6-luna-pro"),
+            openrouter("anthropic/claude-sonnet-5.5", Thinking::FromEffort),
+            openrouter("anthropic/claude-sonnet-5", Thinking::FromEffort),
+            openrouter("anthropic/claude-opus-5.5", Thinking::FromEffort),
+            openrouter("anthropic/claude-opus-5", Thinking::FromEffort),
+            openrouter("anthropic/claude-fable-5", Thinking::FromEffort),
+            openrouter("anthropic/claude-fable-5.1", Thinking::FromEffort),
+            Curated {
+                window: Window::PriceTier,
+                ..openrouter("anthropic/claude-haiku-5.5", Thinking::FromEffort)
+            },
+            openrouter("meta/muse-spark-1.3", Thinking::FromEffort),
+            openrouter("meta/muse-spark-1.3-contributor", Thinking::FromEffort),
+            openrouter("meta/muse-wonder", Thinking::FromEffort),
+            openrouter("meta/muse-spark-open", Thinking::FromEffort),
+            openrouter("meta/muse-glimmer-30b", Thinking::FromEffort),
+            openrouter("thinkingmachines/inkling", Thinking::FromEffort),
+            openrouter("thinkingmachines/inkling-small", Thinking::FromEffort),
+            openrouter("xiaomi/mimo-v2.6-pro", Thinking::FromEffort),
+            openrouter("xiaomi/mimo-v2.6-pro-ultraspeed", Thinking::FromEffort),
+            openrouter("xiaomi/mimo-v2.6-flash", Thinking::FromEffort),
+            openrouter("fireworks/ember-1", Thinking::FromEffort),
+            openrouter("recursive/flint-v1.0:free", Thinking::FromEffort),
+            openrouter("minimax/minimax-m3", Thinking::FromEffort),
+            openrouter("minimax/minimax-m3.1-flash", Thinking::FromEffort),
+            openrouter("elorian/glimpse", Thinking::FromEffort),
+            openrouter("xingchen-agi/xing4.0-29b-a4b:free", Thinking::FromEffort),
+            openrouter("inception/mercury-3", Thinking::FromEffort),
+            openrouter("unbiased/pareto-26.10", Thinking::FromEffort),
+            openrouter("unbiased/pareto-26.9", Thinking::FromEffort),
+            openrouter("~unbiased/pareto-latest", Thinking::FromEffort),
+            openrouter("nvidia/nemotron-3.5-super-vl", Thinking::FromEffort),
+            openrouter("nvidia/nemotron-3.5-super-vl:free", Thinking::FromEffort),
+            openrouter("nvidia/nemotron-3.5-lightning", Thinking::FromEffort),
+            openrouter("nvidia/nemotron-3.5-lightning:free", Thinking::FromEffort),
+            openrouter("nvidia/nemotron-3-ultra-550b-a55b", Thinking::FromEffort),
+            openrouter(
+                "nvidia/nemotron-3-ultra-550b-a55b:free",
+                Thinking::FromEffort,
+            ),
+            openrouter(
+                "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+                Thinking::FromEffort,
+            ),
+            openrouter("liquid/lfm-2.5-24b-a2b", Thinking::FromEffort),
+            openrouter("liquid/lfm-2.5-2.6b", Thinking::FromEffort),
+            openrouter("liquid/lfm-2.5-2.6b:free", Thinking::FromEffort),
+            openrouter("mistralai/mistral-large-4-0", Thinking::FromEffort),
+            openrouter("mistralai/mistral-medium-3-5", Thinking::FromEffort),
+            openrouter("mistralai/mistral-small-2603", Thinking::FromEffort),
+            openrouter("reflection/beam-1.0-501b-a23b", Thinking::FromEffort),
+            openrouter("prism-ml/ternary-bonsai-2-9b", Thinking::FromEffort),
+            openrouter("prism-ml/ternary-bonsai-2-27b", Thinking::FromEffort),
+            openrouter("inclusionai/ling-3.1-flash", Thinking::FromEffort),
+            openrouter("inclusionai/ling-3.0-flash-vl", Thinking::FromEffort),
+            openrouter("aion-labs/aion-3.5", Thinking::FromEffort),
+            openrouter("aion-labs/aion-3.5-mini", Thinking::FromEffort),
+            openrouter("upstage/solar-pro4", Thinking::FromEffort),
+            openrouter("upstage/solar-mini4", Thinking::FromEffort),
+            openrouter("stepfun/step-5-preview", Thinking::FromEffort),
+            openrouter("stepfun/step-3.7-flash", Thinking::FromEffort),
+            openrouter_tiered("sakana/fugu-ultra-v2"),
+            openrouter("sakana/fugu-max", Thinking::FromEffort),
+            openrouter("sakana/sakana-namazu", Thinking::FromEffort),
+            openrouter("nex-agi/nex-n2.5-pro", Thinking::FromEffort),
+            openrouter("tencent/hy4-preview", Thinking::FromEffort),
+            openrouter("tencent/hy4", Thinking::FromEffort),
+            openrouter("ricursiveai/ripple-65b-preview", Thinking::FromEffort),
+            openrouter("stealth/crouton-alpha", Thinking::FromEffort),
+            openrouter("ibm-granite/granite-4.2-8b", Thinking::FromEffort),
+            openrouter("meituan/longcat-2.0", Thinking::FromEffort),
+            openrouter("cohere/command-a-plus", Thinking::FromEffort),
+            openrouter("cohere/north-mini-code:free", Thinking::FromEffort),
+            openrouter("bytedance-seed/seed-2-1-turbo", Thinking::FromEffort),
+            openrouter_tiered("bytedance-seed/seed-2.0-lite"),
+            openrouter_tiered("bytedance-seed/seed-2.0-mini"),
+            openrouter("perceptron/perceptron-mk1.5", Thinking::FromEffort),
+            openrouter("particle-ai/particle-1", Thinking::FromEffort),
+        ],
+    },
+];
+
+/// One Codex model, pinned by hand. models.dev has no OpenAI Codex
+/// provider (subscription backends carry no public price sheet), so this
+/// table keeps an explicit list to avoid aliases. GPT 6 Sol and Luna's limits
+/// and levels come from Codex CLI's models.json (openai/codex#47332), and
+/// their prices come from OpenAI plus models.dev (cache write, no temperature).
+///
+/// The `id` is the backend's model name, the generator namespaces the
+/// catalog id as `codex/<id>` and stores the backend name in compat's
+/// `requestModel`. That split exists because cupel's catalog is one flat
+/// id namespace (merge_models replaces by id, /model addresses by id),
+/// and the openai provider already owns "gpt 6 sol" etc.
+pub struct PinnedCodex {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub vision: bool,
+    pub cost: (f64, f64, f64, f64),
+    pub long_context_tier: bool,
+    pub context_window: u64,
+    pub max_context_window: Option<u64>,
+    pub levels: &'static [&'static str],
+    pub temperature: bool,
+}
+
+/// The effort scale advertised by the Codex backend for GPT 6 models.
+const CODEX_LEVELS_TO_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Row order = catalog order, the first row is the `/provider
+/// openai codex` default. gpt 6.1 sol leads by choice, the remaining
+/// models keep their relative order. Other providers keep their defaults.
+pub const OPENAI_CODEX_MODELS: &[PinnedCodex] = &[
+    // The model card lists the same standard input/output prices as Sol
+    // but $0.10/M cached input. Codex CLI's models.json gives GPT 6.1 Sol
+    // the same ceiling and effort scale as Sol (checked 2026 10 08).
+    // Source OpenAI's introduction of GPT 6.1 Sol
+    // The 500k window is OpenAI's Codex default since 2026 10 12. It comes
+    // from the backend's live model list, the models.json bundled with
+    // Codex CLI still says 272k (checked 2026 10 16). The >272k tier stays,
+    // the cost line shows API equivalent prices, and the API still charges
+    // the tier.
+    // Source Thibault Sottiaux's announcement on X, post 2109430343346581527
+    PinnedCodex {
+        id: "gpt-6.1-sol",
+        name: "GPT-6.1 Sol",
+        vision: true,
+        cost: (2.0, 10.0, 0.1, 2.5),
+        long_context_tier: true,
+        context_window: 500_000,
+        max_context_window: Some(872_000),
+        levels: CODEX_LEVELS_TO_MAX,
+        temperature: false,
+    },
+    // Prices and temperature support, models.dev's openai/gpt 6.1 terra.
+    // Codex windows and efforts (no "none"), checked 2026 10 27,
+    // Source models.json in the OpenAI Codex models manager on GitHub
+    PinnedCodex {
+        id: "gpt-6.1-terra",
+        name: "GPT-6.1 Terra",
+        vision: true,
+        cost: (1.0, 5.0, 0.05, 1.25),
+        long_context_tier: true,
+        context_window: 500_000,
+        max_context_window: Some(872_000),
+        levels: CODEX_LEVELS_TO_MAX,
+        temperature: false,
+    },
+    PinnedCodex {
+        id: "gpt-6-astra",
+        name: "GPT-6 Astra",
+        vision: true,
+        cost: (10.0, 50.0, 1.0, 12.5),
+        long_context_tier: true,
+        context_window: 272_000,
+        max_context_window: Some(872_000),
+        levels: CODEX_LEVELS_TO_MAX,
+        temperature: false,
+    },
+    PinnedCodex {
+        id: "gpt-6-luna",
+        name: "GPT-6 Luna",
+        vision: true,
+        cost: (0.1, 0.5, 0.01, 0.125),
+        long_context_tier: true,
+        context_window: 272_000,
+        max_context_window: Some(872_000),
+        levels: CODEX_LEVELS_TO_MAX,
+        temperature: false,
+    },
+];
+
+/// Catalog rows that also ship a twin with an ultrafast suffix.
+/// Ultrafast is not a separate model, it is the same model on OpenAI's
+/// fastest serving tier, chosen per request with the body field
+/// `service_tier` set to `ultrafast`. A twin row turns that tier into
+/// something `/model` can switch to (main.rs `with_ultrafast_twins`).
+/// Codex access depends on the ChatGPT plan (Pro 500, Enterprise, Edu at
+/// launch), the backend, not cupel, enforces that.
+/// Source OpenAI's developer guide to ultrafast mode
+pub const ULTRAFAST_BASES: &[&str] = &["gpt-6.1-sol", "codex/gpt-6.1-sol"];
+
+/// Every Ultrafast price is 6x the Standard price, including the >272k long context
+/// tier. models.dev lists only the short context half, so the generator scales the
+/// Standard row instead.
+pub const ULTRAFAST_PRICE_FACTOR: f64 = 6.0;

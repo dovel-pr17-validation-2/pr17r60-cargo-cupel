@@ -1,0 +1,35 @@
+[package]
+name = "cupel-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# A bare `cargo run` in the workspace root sees two binaries (this one
+# and generate catalog), this key makes it launch cupel.
+default-run = "cupel"
+
+# Without this table Cargo would name the executable after the package
+# (TUI). The binary keeps the name users type, `cupel`.
+[[bin]]
+name = "cupel"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+cupel-agent.workspace = true
+cupel-coding-agent.workspace = true
+cupel-core.workspace = true
+futures-util.workspace = true
+ignore.workspace = true
+ratatui.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+unicode-width.workspace = true
+
+[lints]
+workspace = true

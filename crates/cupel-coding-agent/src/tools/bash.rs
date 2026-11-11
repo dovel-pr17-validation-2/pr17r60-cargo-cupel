@@ -1,0 +1,739 @@
+//! Runs bash in the agent's working directory, streaming
+//! stdout+stderr into a bounded accumulator. The design constraints all come
+//! from real agent behavior,
+//!
+//! * **Bounded memory, full fidelity.** A command can print gigabytes. The
+//!   accumulator keeps only a rolling tail in memory. The model gets the
+//!   last 2000 lines or 50 KB, since errors tend to be at the end. It spills
+//!   the complete output to a temp file the moment limits are exceeded, so the
+//!   truncation notice can say "Full output, /tmp/...".
+//! * **Kill the whole tree.** `cargo test` spawns children. Killing just the
+//!   shell leaves them running. The child gets its own process group, and
+//!   abort/timeout kills the group. Because this workspace forbids `unsafe`
+//!   (no direct `kill`), the group kill shells out to a forceful kill of the process group
+//!   * one extra process spawn on the rare abort path is a fine trade.
+//! * **Exit codes are errors.** A non zero exit becomes an error tool result
+//!   (with the output attached) so the model *sees* failure as failure.
+//! * **The shell's exit ends the call, not the pipes'.** A background
+//!   process (`server &`) inherits stdout/stderr and can hold them open for
+//!   hours. Once the shell exits, reading stops as soon as the pipes stay
+//!   quiet for 500 ms, the background process itself keeps running.
+
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use cupel_agent::types::{AgentTool, AgentToolResult, ToolError, ToolUpdateFn};
+use cupel_core::types::now_ms;
+
+use crate::process::{EXIT_STDIO_GRACE, OutputChunk, kill_process_group, output_chunks};
+use crate::truncate::{
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, TruncationOptions, TruncationResult,
+    format_size, truncate_tail,
+};
+
+/// Minimum interval between streamed progress updates to the UI.
+const UPDATE_THROTTLE: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Deserialize)]
+struct BashArgs {
+    command: String,
+    timeout: Option<f64>,
+}
+
+/// Streaming output tracker with bounded memory (see module docs).
+struct OutputAccumulator {
+    max_lines: usize,
+    max_bytes: usize,
+    tail: Vec<u8>,
+    tail_at_line_boundary: bool,
+    total_bytes: usize,
+    completed_lines: usize,
+    has_open_line: bool,
+    current_line_bytes: usize,
+    pending: Vec<u8>,
+    temp: Option<(PathBuf, std::fs::File)>,
+}
+
+impl OutputAccumulator {
+    fn new() -> Self {
+        Self {
+            max_lines: DEFAULT_MAX_LINES,
+            max_bytes: DEFAULT_MAX_BYTES,
+            tail: Vec::new(),
+            tail_at_line_boundary: true,
+            total_bytes: 0,
+            completed_lines: 0,
+            has_open_line: false,
+            current_line_bytes: 0,
+            pending: Vec::new(),
+            temp: None,
+        }
+    }
+
+    fn total_lines(&self) -> usize {
+        self.completed_lines + usize::from(self.has_open_line)
+    }
+
+    fn append(&mut self, data: &[u8]) {
+        self.total_bytes += data.len();
+
+        // Line accounting, count newlines, track the open last line's size
+        // (needed for the "line is 3MB" message when one line eats the budget).
+        let mut last_newline = None;
+        for (i, byte) in data.iter().enumerate() {
+            if *byte == b'\n' {
+                self.completed_lines += 1;
+                last_newline = Some(i);
+            }
+        }
+        match last_newline {
+            None => {
+                self.current_line_bytes += data.len();
+                self.has_open_line = !data.is_empty() || self.has_open_line;
+            }
+            Some(i) => {
+                self.current_line_bytes = data.len() - i - 1;
+                self.has_open_line = self.current_line_bytes > 0;
+            }
+        }
+
+        // Rolling tail with a trim threshold above the display budget so we
+        // always have at least max_bytes of complete lines to show.
+        self.tail.extend_from_slice(data);
+        let rolling_cap = self.max_bytes * 2;
+        if self.tail.len() > rolling_cap * 2 {
+            let mut start = self.tail.len() - rolling_cap;
+            // Never cut a UTF 8 character in half (continuation bytes are
+            // 0b10xx_xxxx).
+            while start < self.tail.len() && (self.tail[start] & 0xC0) == 0x80 {
+                start += 1;
+            }
+            self.tail_at_line_boundary = start == 0 || self.tail[start - 1] == b'\n';
+            self.tail.drain(..start);
+        }
+
+        // Full output preservation, buffer in memory until limits trip, then
+        // spill everything to a temp file and stream into it from then on.
+        if let Some((_, file)) = &mut self.temp {
+            use std::io::Write as _;
+            let _ = file.write_all(data);
+        } else {
+            self.pending.extend_from_slice(data);
+            if self.over_limits() {
+                self.open_temp_file();
+            }
+        }
+    }
+
+    fn over_limits(&self) -> bool {
+        self.total_bytes > self.max_bytes || self.total_lines() > self.max_lines
+    }
+
+    fn open_temp_file(&mut self) {
+        if self.temp.is_some() {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "cupel-bash-{}-{}.log",
+            std::process::id(),
+            now_ms()
+        ));
+        if let Ok(mut file) = std::fs::File::create(&path) {
+            use std::io::Write as _;
+            let _ = file.write_all(&self.pending);
+            self.pending = Vec::new();
+            self.temp = Some((path, file));
+        }
+    }
+
+    /// Current display view, tail truncated text plus truncation metadata
+    /// with true totals (the tail alone under counts what scrolled past).
+    fn snapshot(&self) -> (String, TruncationResult, Option<PathBuf>) {
+        let mut text = String::from_utf8_lossy(&self.tail).into_owned();
+        if !self.tail_at_line_boundary
+            && let Some(newline) = text.find('\n')
+        {
+            text = text[newline + 1..].to_string();
+        }
+        let mut truncation = truncate_tail(
+            &text,
+            TruncationOptions {
+                max_lines: Some(self.max_lines),
+                max_bytes: Some(self.max_bytes),
+            },
+        );
+        // Overlay the real totals, the tail buffer only saw part of it all.
+        truncation.truncated = self.over_limits();
+        truncation.total_lines = self.total_lines();
+        truncation.total_bytes = self.total_bytes;
+        if truncation.truncated && truncation.truncated_by.is_none() {
+            truncation.truncated_by = Some(if self.total_bytes > self.max_bytes {
+                TruncatedBy::Bytes
+            } else {
+                TruncatedBy::Lines
+            });
+        }
+        let content = truncation.content.clone();
+        (
+            content,
+            truncation,
+            self.temp.as_ref().map(|(p, _)| p.clone()),
+        )
+    }
+}
+
+pub struct BashTool {
+    cwd: PathBuf,
+    description: String,
+}
+
+impl BashTool {
+    #[must_use]
+    pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            description: format!(
+                "Execute a bash command in the current working directory. Returns stdout and \
+                 stderr. Output is truncated to last {DEFAULT_MAX_LINES} lines or {}KB \
+                 (whichever is hit first). If truncated, full output is saved to a temp file. \
+                 Optionally provide a timeout in seconds.",
+                DEFAULT_MAX_BYTES / 1024
+            ),
+        }
+    }
+}
+
+fn is_executable(path: &Path) -> bool {
+    path.metadata().is_ok_and(|metadata| {
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    })
+}
+
+fn resolve_shell(system_bash: &Path, path: Option<&OsStr>) -> PathBuf {
+    if is_executable(system_bash) {
+        return system_bash.to_path_buf();
+    }
+    path.and_then(|path| {
+        std::env::split_paths(path)
+            .map(|dir| dir.join("bash"))
+            .filter(|candidate| is_executable(candidate))
+            // PATH entries can be relative to cupel's process directory,
+            // commands execute with the agent's (possibly different) cwd.
+            .find_map(|candidate| candidate.canonicalize().ok())
+    })
+    .unwrap_or_else(|| PathBuf::from("sh"))
+}
+
+async fn next_output_chunk(
+    rx: &mut mpsc::Receiver<OutputChunk>,
+    shell_exited: bool,
+) -> Option<OutputChunk> {
+    if shell_exited {
+        tokio::time::timeout(EXIT_STDIO_GRACE, rx.recv())
+            .await
+            .ok()
+            .flatten()
+    } else {
+        rx.recv().await
+    }
+}
+
+enum RunOutcome {
+    Exited(Option<i32>),
+    Aborted,
+    TimedOut,
+}
+
+#[async_trait::async_trait]
+impl AgentTool for BashTool {
+    fn name(&self) -> &str {
+        "bash"
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Bash command to execute"
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Timeout in seconds (optional, no default timeout)"
+                }
+            },
+            "required": ["command"]
+        })
+    }
+
+    /// `$ <command>` indicates that the command ran and is
+    /// shown verbatim. The timeout rides along when the model set one.
+    fn describe_call(&self, args: &Value) -> String {
+        let Some(command) = args.get("command").and_then(Value::as_str) else {
+            return self.name().to_string();
+        };
+        match args.get("timeout").and_then(Value::as_f64) {
+            Some(timeout) => format!("$ {command} (timeout {timeout}s)"),
+            None => format!("$ {command}"),
+        }
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        args: Value,
+        cancel: CancellationToken,
+        on_update: Option<ToolUpdateFn>,
+    ) -> Result<AgentToolResult, ToolError> {
+        let args: BashArgs = serde_json::from_value(args)?;
+        if let Some(timeout) = args.timeout
+            && (!timeout.is_finite() || timeout <= 0.0)
+        {
+            return Err("Invalid timeout: must be a finite number of seconds".into());
+        }
+        if !self.cwd.exists() {
+            return Err(format!(
+                "Working directory does not exist: {}\nCannot execute bash commands.",
+                self.cwd.display()
+            )
+            .into());
+        }
+        if cancel.is_cancelled() {
+            return Err("Operation aborted".into());
+        }
+
+        // Commands are written for bash, regardless of the user's login shell.
+        let shell = resolve_shell(Path::new("/bin/bash"), std::env::var_os("PATH").as_deref());
+        let mut command = tokio::process::Command::new(shell);
+        command
+            .arg("-c")
+            .arg(&args.command)
+            .current_dir(&self.cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // A fresh process group so abort/timeout can kill the whole tree.
+        #[cfg(unix)]
+        command.process_group(0);
+
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("Failed to run shell: {e}"))?;
+        let pid = child.id();
+
+        // stdout and stderr are read on their own tasks feeding one channel,
+        // preserving arrival order well enough for interleaved output.
+        let mut rx = output_chunks(&mut child);
+
+        let mut output = OutputAccumulator::new();
+        // Backdated so the first chunk sends an update immediately, falls
+        // back to "now" on platforms where Instant can't go that far back.
+        let mut last_update = std::time::Instant::now()
+            .checked_sub(UPDATE_THROTTLE)
+            .unwrap_or_else(std::time::Instant::now);
+        let deadline = args
+            .timeout
+            .map(|secs| tokio::time::Instant::now() + Duration::from_secs_f64(secs));
+
+        let mut exited: Option<std::process::ExitStatus> = None;
+
+        // Main loop, pump output chunks, racing cancellation, the timeout,
+        // and the shell's own exit.
+        let mut outcome: Option<RunOutcome> = None;
+        while outcome.is_none() {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    if let Some(pid) = pid {
+                        kill_process_group(pid);
+                    }
+                    // Also SIGKILL the direct child via tokio, even if the
+                    // external `kill` misbehaves, the shell itself dies (and
+                    // bash executing a command string usually execs the command, so the shell is
+                    // the command).
+                    let _ = child.start_kill();
+                    outcome = Some(RunOutcome::Aborted);
+                }
+                () = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(pid) = pid {
+                        kill_process_group(pid);
+                    }
+                    let _ = child.start_kill();
+                    outcome = Some(RunOutcome::TimedOut);
+                }
+                // Each chunk starts a fresh quiet interval after shell exit.
+                chunk = next_output_chunk(&mut rx, exited.is_some()) => {
+                    match chunk {
+                        Some(chunk) => {
+                            output.append(chunk.as_bytes());
+                            if let Some(on_update) = &on_update
+                                && last_update.elapsed() >= UPDATE_THROTTLE
+                            {
+                                last_update = std::time::Instant::now();
+                                let (content, _, _) = output.snapshot();
+                                on_update(AgentToolResult::text(content));
+                            }
+                        }
+                        // Both pipes closed, or the exited shell's pipes stayed quiet.
+                        None => {
+                            let status = match exited {
+                                Some(status) => status,
+                                None => child.wait().await?,
+                            };
+                            outcome = Some(RunOutcome::Exited(status.code()));
+                        }
+                    }
+                }
+                // The shell exited, but a background process it started
+                // (`server &`) may hold the pipes open for hours. Don't wait
+                // for them to close, start the quiet timer instead.
+                status = child.wait(), if exited.is_none() => {
+                    exited = Some(status?);
+                }
+            }
+        }
+
+        // After a kill, drain whatever was already in flight and reap the
+        // child so it doesn't linger as a zombie.
+        if !matches!(outcome, Some(RunOutcome::Exited(_))) {
+            while let Ok(Some(chunk)) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                output.append(chunk.as_bytes());
+            }
+            // Bounded reap, if the process somehow survived both kills, give
+            // up after a beat instead of hanging the turn. The OS reaps the
+            // zombie when cupel exits, which beats a frozen agent.
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        }
+
+        let (content, truncation, full_output_path) = output.snapshot();
+        let mut text = if content.is_empty() {
+            String::new()
+        } else {
+            content
+        };
+        let mut details: Option<Value> = None;
+
+        if truncation.truncated {
+            let start_line = truncation.total_lines - truncation.output_lines + 1;
+            let end_line = truncation.total_lines;
+            let path_note = full_output_path
+                .as_ref()
+                .map_or_else(String::new, |p| format!(" Full output: {}", p.display()));
+            let notice = if truncation.last_line_partial {
+                format!(
+                    "[Showing last {} of line {end_line} (line is {}).{path_note}]",
+                    format_size(truncation.output_bytes),
+                    format_size(output.current_line_bytes),
+                )
+            } else if truncation.truncated_by == Some(TruncatedBy::Lines) {
+                format!(
+                    "[Showing lines {start_line}-{end_line} of {}.{path_note}]",
+                    truncation.total_lines
+                )
+            } else {
+                format!(
+                    "[Showing lines {start_line}-{end_line} of {} ({} limit).{path_note}]",
+                    truncation.total_lines,
+                    format_size(DEFAULT_MAX_BYTES),
+                )
+            };
+            text = if text.is_empty() {
+                notice
+            } else {
+                format!("{text}\n\n{notice}")
+            };
+            details = Some(json!({
+                "truncated": true,
+                "totalLines": truncation.total_lines,
+                "fullOutputPath": full_output_path.map(|p| p.display().to_string()),
+            }));
+        }
+
+        // Failure paths return Err so the loop marks the result as an error.
+        let append_status = |text: &str, status: &str| {
+            if text.is_empty() {
+                status.to_string()
+            } else {
+                format!("{text}\n\n{status}")
+            }
+        };
+        match outcome {
+            Some(RunOutcome::Aborted) => Err(append_status(&text, "Command aborted").into()),
+            Some(RunOutcome::TimedOut) => Err(append_status(
+                &text,
+                &format!(
+                    "Command timed out after {} seconds",
+                    args.timeout.unwrap_or(0.0)
+                ),
+            )
+            .into()),
+            Some(RunOutcome::Exited(code)) if code != Some(0) => {
+                let code_text =
+                    code.map_or_else(|| "killed by signal".to_string(), |c| c.to_string());
+                Err(append_status(&text, &format!("Command exited with code {code_text}")).into())
+            }
+            _ => Ok(AgentToolResult {
+                content: vec![cupel_core::types::ToolResultContent::Text(
+                    cupel_core::types::TextContent::plain(if text.is_empty() {
+                        "(no output)".to_string()
+                    } else {
+                        text
+                    }),
+                )],
+                details,
+                terminate: false,
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cupel_core::types::ToolResultContent;
+
+    fn tool() -> BashTool {
+        BashTool::new(std::env::temp_dir())
+    }
+
+    async fn run(args: Value) -> Result<String, String> {
+        let result = tool()
+            .execute("c", args, CancellationToken::new(), None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let ToolResultContent::Text(text) = &result.content[0] else {
+            return Err("expected text".to_string());
+        };
+        Ok(text.text.clone())
+    }
+
+    #[test]
+    fn describe_call_is_the_shell_line() {
+        let tool = BashTool::new("/tmp");
+        assert_eq!(
+            tool.describe_call(&json!({"command": "cargo test -p cupel-core"})),
+            "$ cargo test -p cupel-core"
+        );
+        assert_eq!(
+            tool.describe_call(&json!({"command": "sleep 5", "timeout": 30})),
+            "$ sleep 5 (timeout 30s)"
+        );
+        // Arguments still streaming in (or malformed), the bare name.
+        assert_eq!(tool.describe_call(&json!({})), "bash");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_selection_prefers_executable_bash_over_path_and_falls_back_to_sh() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "cupel-shell-selection-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let preferred = root.join("system-bash");
+        let from_path = bin.join("bash");
+        let path = std::env::join_paths([&bin]).unwrap();
+
+        std::fs::write(&from_path, "").unwrap();
+        assert_eq!(resolve_shell(&preferred, Some(&path)), PathBuf::from("sh"));
+        std::fs::set_permissions(&from_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve_shell(&preferred, Some(&path)),
+            from_path.canonicalize().unwrap()
+        );
+
+        std::fs::write(&preferred, "").unwrap();
+        std::fs::set_permissions(&preferred, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resolve_shell(&preferred, Some(&path)), preferred);
+        assert_eq!(resolve_shell(&preferred, None), preferred);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn runs_bash_syntax_instead_of_the_login_shell() {
+        let out = run(
+            json!({"command": "for i in 1 2 3; do echo $i; done; echo BASH_VERSION=$BASH_VERSION"}),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("1\n2\n3\n"), "got: {out}");
+        assert!(
+            out.contains("BASH_VERSION=") && !out.contains("BASH_VERSION=\n"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn captures_stdout_and_stderr() {
+        let out = run(json!({"command": "echo out; echo err >&2"}))
+            .await
+            .unwrap();
+        assert!(out.contains("out"), "got: {out}");
+        assert!(out.contains("err"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn captures_background_stdout_and_stderr() {
+        let out = run(json!({
+            "command": "sh -c 'echo background-out; echo background-err >&2' & echo started"
+        }))
+        .await
+        .unwrap();
+        assert!(out.contains("started"), "got: {out}");
+        assert!(out.contains("background-out"), "got: {out}");
+        assert!(out.contains("background-err"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn nonzero_exit_is_an_error_with_output() {
+        let err = run(json!({"command": "echo boom; exit 3"}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("boom"), "got: {err}");
+        assert!(err.contains("exited with code 3"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn empty_output_reports_no_output() {
+        let out = run(json!({"command": "true"})).await.unwrap();
+        assert_eq!(out, "(no output)");
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_the_command() {
+        let started = std::time::Instant::now();
+        let err = run(json!({"command": "sleep 5", "timeout": 0.2}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "kill was not prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_kills_the_command() {
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel_clone.cancel();
+        });
+        let err = tool()
+            .execute("c", json!({"command": "sleep 5"}), cancel, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("aborted"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn background_process_does_not_hold_the_call_open() {
+        // `sleep 10 &` inherits the pipes and keeps them open for 10 s. The
+        // call must end right after the shell exits, with the shell's code.
+        let started = std::time::Instant::now();
+        let out = run(json!({"command": "sleep 10 & echo started"}))
+            .await
+            .unwrap();
+        assert!(out.contains("started"), "got: {out}");
+        let err = run(json!({"command": "sleep 10 & exit 3"}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("exited with code 3"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited for the background process"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn output_after_the_shell_exits_is_kept() {
+        // Drive the same output channel with virtual time: OS scheduling gaps
+        // must not determine whether this quiet-interval regression passes.
+        let (tx, mut rx) = mpsc::channel(1);
+        let writer = tokio::spawn(async move {
+            for tick in 1..=10 {
+                tokio::time::sleep(EXIT_STDIO_GRACE / 2).await;
+                tx.send(OutputChunk::Stdout(format!("tick{tick}\n").into_bytes()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let started = tokio::time::Instant::now();
+        for tick in 1..=10 {
+            let chunk = next_output_chunk(&mut rx, true)
+                .await
+                .expect("each output chunk must restart the quiet interval");
+            assert_eq!(chunk.as_bytes(), format!("tick{tick}\n").as_bytes());
+        }
+        assert!(started.elapsed() > EXIT_STDIO_GRACE);
+        assert!(next_output_chunk(&mut rx, true).await.is_none());
+        writer.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_background_output_stops_after_the_grace_interval() {
+        let (_tx, mut rx) = mpsc::channel(1);
+        let started = tokio::time::Instant::now();
+        assert!(next_output_chunk(&mut rx, true).await.is_none());
+        assert_eq!(started.elapsed(), EXIT_STDIO_GRACE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn output_before_shell_exit_can_wait_longer_than_the_grace_interval() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(EXIT_STDIO_GRACE * 2).await;
+            tx.send(OutputChunk::Stderr(b"still running\n".to_vec()))
+                .await
+                .unwrap();
+        });
+        let chunk = next_output_chunk(&mut rx, false).await.unwrap();
+        assert_eq!(chunk.as_bytes(), b"still running\n");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_output_truncates_to_tail_and_saves_full_output() {
+        // 3000 lines exceeds the 2000 line limit, the model sees the tail.
+        let err_or_ok = run(json!({"command": "seq 1 3000"})).await.unwrap();
+        assert!(err_or_ok.contains("3000"), "tail should include the end");
+        assert!(!err_or_ok.contains("\n1\n"), "head should be gone");
+        assert!(err_or_ok.contains("Full output:"), "got: {err_or_ok}");
+        assert!(err_or_ok.contains("of 3000"), "got: {err_or_ok}");
+    }
+}

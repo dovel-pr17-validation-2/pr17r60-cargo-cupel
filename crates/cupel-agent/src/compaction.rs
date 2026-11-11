@@ -1,0 +1,1013 @@
+//! Context compaction, keep long sessions inside the model's context window,
+//! in two tiers, cheapest first,
+//!
+//! 1. **Pruning (free)**, elide the bodies of tool results outside the keep
+//!    window. In coding sessions tool output (file reads, grep, bash logs)
+//!    dominates the context and is mostly re derivable because the agent can
+//!    re run the tool. When pruning alone brings the estimate back under
+//!    the threshold, no LLM call happens at all.
+//! 2. **Summarization (one LLM call)**, replace the remaining old history
+//!    with a structured checkpoint summary.
+
+use std::sync::Arc;
+
+use tokio_util::sync::CancellationToken;
+
+use cupel_core::{
+    provider::Registry,
+    types::{
+        AssistantContent, Context, Message, Model, StreamOptions, ToolResultContent,
+        UserContentBody,
+    },
+};
+
+use crate::types::{AgentContext, AgentMessage};
+
+/// Marker prefixed to the summary user message. Doubles as the way to find
+/// the previous summary for iterative updates.
+pub const COMPACTION_MARKER: &str = "[Conversation summary - earlier history was compacted]";
+
+/// Thresholds and retention settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionConfig {
+    pub enabled: bool,
+    pub reserve_tokens: u64,
+    pub keep_recent_tokens: u64,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reserve_tokens: 16_384,
+            keep_recent_tokens: 16_384,
+        }
+    }
+}
+
+impl CompactionConfig {
+    fn for_context_window(self, context_window: u64) -> Self {
+        let budget = 16_384.min(context_window / 4);
+        Self {
+            reserve_tokens: self.reserve_tokens.min(budget),
+            keep_recent_tokens: self.keep_recent_tokens.min(budget),
+            ..self
+        }
+    }
+}
+
+const CHARS_PER_TOKEN: u64 = 4;
+const ESTIMATED_IMAGE_CHARS: u64 = 4800;
+
+pub(crate) fn estimate_message_tokens(message: &AgentMessage) -> u64 {
+    let chars: u64 = match message {
+        AgentMessage::Custom { payload, .. } => payload.to_string().len() as u64,
+        AgentMessage::Metadata { .. } => 0,
+        AgentMessage::Llm(Message::User(user)) => match &user.content {
+            UserContentBody::Text(text) => text.len() as u64,
+            UserContentBody::Blocks(blocks) => blocks
+                .iter()
+                .map(|b| match b {
+                    cupel_core::types::UserContent::Text(t) => t.text.len() as u64,
+                    cupel_core::types::UserContent::Image(_) => ESTIMATED_IMAGE_CHARS,
+                })
+                .sum(),
+        },
+        AgentMessage::Llm(Message::Assistant(assistant)) => assistant
+            .content
+            .iter()
+            .map(|b| match b {
+                AssistantContent::Text(t) => t.text.len() as u64,
+                AssistantContent::Thinking(t) => t.thinking.len() as u64,
+                AssistantContent::ToolCall(tc) => {
+                    tc.name.len() as u64 + tc.arguments.to_string().len() as u64
+                }
+            })
+            .sum(),
+        AgentMessage::Llm(Message::ToolResult(result)) => result
+            .content
+            .iter()
+            .map(|b| match b {
+                ToolResultContent::Text(t) => t.text.len() as u64,
+                ToolResultContent::Image(_) => ESTIMATED_IMAGE_CHARS,
+            })
+            .sum(),
+    };
+    chars.div_ceil(CHARS_PER_TOKEN)
+}
+
+/// Estimate total context tokens for the next request, last exact provider
+/// usage + estimates for everything after it (+ fixed prefix when no usage
+/// anchor exists yet).
+#[must_use]
+pub fn estimate_context_tokens(context: &AgentContext) -> u64 {
+    let messages = &context.messages;
+
+    let anchor = messages.iter().enumerate().rev().find_map(|(i, m)| {
+        let AgentMessage::Llm(Message::Assistant(a)) = m else {
+            return None;
+        };
+        if matches!(
+            a.stop_reason,
+            cupel_core::types::StopReason::Error | cupel_core::types::StopReason::Aborted
+        ) {
+            return None;
+        }
+        let total = if a.usage.total_tokens > 0 {
+            a.usage.total_tokens
+        } else {
+            a.usage.input + a.usage.output + a.usage.cache_read + a.usage.cache_write
+        };
+        (total > 0).then_some((i, total))
+    });
+
+    if let Some((index, usage_tokens)) = anchor {
+        let trailing: u64 = messages[index + 1..]
+            .iter()
+            .map(estimate_message_tokens)
+            .sum();
+        return usage_tokens + trailing;
+    }
+
+    // No anchor, estimate everything including system prompt + tool schemas.
+    let mut tokens: u64 = messages.iter().map(estimate_message_tokens).sum();
+    tokens += (context.system_prompt.len() as u64).div_ceil(CHARS_PER_TOKEN);
+    for tool in &context.tools {
+        tokens += ((tool.description().len() + tool.parameters().to_string().len()) as u64)
+            .div_ceil(CHARS_PER_TOKEN);
+    }
+    tokens
+}
+
+/// Provider usage describes the original transcript. After editing history,
+/// invalidate every anchor so both agent estimation and provider output
+/// clamping fall back to message lengths until the next fresh response.
+pub(crate) fn invalidate_usage_anchors(messages: &mut [AgentMessage]) {
+    for message in messages {
+        if let AgentMessage::Llm(Message::Assistant(assistant)) = message {
+            assistant.usage = cupel_core::types::Usage::default();
+        }
+    }
+}
+
+/// Old provider usage includes an older projection, do not count it twice.
+pub(crate) fn estimate_request_tokens(context: &AgentContext, extra: &[AgentMessage]) -> u64 {
+    if extra.is_empty() {
+        return estimate_context_tokens(context);
+    }
+    let mut request = context.clone();
+    invalidate_usage_anchors(&mut request.messages);
+    request.messages.extend_from_slice(extra);
+    estimate_context_tokens(&request)
+}
+
+/// Should this context be compacted before the next request?
+#[must_use]
+pub fn should_compact(context_tokens: u64, context_window: u64, config: &CompactionConfig) -> bool {
+    if !config.enabled || context_window == 0 {
+        return false;
+    }
+    let config = config.for_context_window(context_window);
+    context_tokens > context_window.saturating_sub(config.reserve_tokens)
+}
+
+/// A model sized cut point, or none when the entire history must be kept.
+pub(crate) fn cut_index(
+    context: &AgentContext,
+    context_window: u64,
+    config: &CompactionConfig,
+) -> Option<usize> {
+    let config = config.for_context_window(context_window);
+    let cut = find_cut_index(&context.messages, config.keep_recent_tokens);
+    // Local records survive compaction unchanged and cannot justify a
+    // summarizer request by themselves, even when the fixed prompt is large.
+    (cut > 0
+        && context.messages[..cut]
+            .iter()
+            .any(|message| !matches!(message, AgentMessage::Metadata { .. })))
+    .then_some(cut)
+}
+
+/// Index of the first message kept verbatim. Everything before it gets
+/// summarized. Walks back accumulating the keep budget, then snaps to the
+/// next user/custom message boundary, falling back to the next assistant
+/// message (never between a tool call and its result).
+fn find_cut_index(messages: &[AgentMessage], keep_recent_tokens: u64) -> usize {
+    let mut accumulated: u64 = 0;
+    let mut budget_start = messages.len();
+    for (i, message) in messages.iter().enumerate().rev() {
+        accumulated += estimate_message_tokens(message);
+        budget_start = i;
+        if accumulated >= keep_recent_tokens {
+            break;
+        }
+    }
+    // Snap forward to a turn boundary at or after the budget start.
+    for (i, message) in messages.iter().enumerate().skip(budget_start) {
+        if matches!(
+            message,
+            AgentMessage::Llm(Message::User(_)) | AgentMessage::Custom { .. }
+        ) {
+            return i;
+        }
+    }
+    // No user/custom boundary in the tail (one giant turn), snap forward
+    // to an assistant so retained results never lose their tool calls.
+    // If none remains, summarize everything rather than keep orphaned results.
+    messages
+        .iter()
+        .enumerate()
+        .skip(budget_start)
+        .find_map(|(i, message)| {
+            matches!(message, AgentMessage::Llm(Message::Assistant(_))).then_some(i)
+        })
+        .unwrap_or(messages.len())
+}
+
+/// Replacement body for an elided tool result. Tells the model exactly how
+/// to recover, run the tool again.
+pub const ELIDED_TOOL_RESULT: &str =
+    "[tool output elided by compaction - re-run the tool if the output is needed again]";
+
+/// Results at or below this many content bytes are left alone, replacing a
+/// small result with the ~80 byte stub gains almost nothing and loses
+/// information. The floor also makes pruning idempotent because an already elided
+/// result is itself below the floor.
+const PRUNE_MIN_BYTES: u64 = 256;
+
+/// Elide the bodies of all (large) tool results in `messages`. The caller
+/// passes only the slice outside the keep window. Tool calls stay intact,
+/// so the conversation narrative ("the agent read foo.rs, then edited it")
+/// survives, only the bulky, re derivable payloads go. Results of the tools named in
+/// `keep` are never elided (see `reproducible`). Returns how many
+/// results were elided.
+fn elide_stale_tool_results(messages: &mut [AgentMessage], keep: &[&str]) -> usize {
+    let mut pruned = 0;
+    for message in messages {
+        let AgentMessage::Llm(Message::ToolResult(result)) = message else {
+            continue;
+        };
+        if keep.contains(&result.tool_name.as_str()) {
+            continue;
+        }
+        let content_bytes: u64 = result
+            .content
+            .iter()
+            .map(|block| match block {
+                ToolResultContent::Text(t) => t.text.len() as u64,
+                // Images are the biggest payloads of all.
+                ToolResultContent::Image(_) => ESTIMATED_IMAGE_CHARS,
+            })
+            .sum();
+        if content_bytes <= PRUNE_MIN_BYTES {
+            continue;
+        }
+        result.content = vec![ToolResultContent::Text(
+            cupel_core::types::TextContent::plain(ELIDED_TOOL_RESULT),
+        )];
+        // Details are tool private metadata riding alongside the content.
+        // They can be elided for the same reason.
+        result.details = None;
+        pruned += 1;
+    }
+    pruned
+}
+
+pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+
+const SUMMARIZATION_PROMPT: &str = "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.\n\nUse this EXACT format:\n\n## Goal\n[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned by user]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [Ordered list of what should happen next]\n\n## Critical Context\n- [Any data, examples, or references needed to continue]\n- [Or \"(none)\" if not applicable]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+
+const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.\n\nUpdate the existing structured summary with new information. RULES:\n- PRESERVE all existing information from the previous summary\n- ADD new progress, decisions, and context from the new messages\n- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed\n- UPDATE \"Next Steps\" based on what was accomplished\n- PRESERVE exact file paths, function names, and error messages\n- If something is no longer relevant, you may remove it\n\nUse the same EXACT format as the previous summary (Goal / Constraints & Preferences / Progress / Key Decisions / Next Steps / Critical Context).\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+
+/// Cap for tool results inside the serialized conversation. Full outputs
+/// would blow the summarization request itself.
+const SERIALIZED_TOOL_RESULT_CHARS: usize = 2000;
+
+/// Flatten messages to readable text for the summarization prompt.
+fn serialize_conversation(messages: &[AgentMessage]) -> String {
+    let mut out = String::new();
+    for message in messages {
+        match message {
+            AgentMessage::Llm(Message::User(user)) => {
+                out.push_str("[User]\n");
+                match &user.content {
+                    UserContentBody::Text(text) => out.push_str(text),
+                    UserContentBody::Blocks(blocks) => {
+                        for block in blocks {
+                            match block {
+                                cupel_core::types::UserContent::Text(t) => out.push_str(&t.text),
+                                cupel_core::types::UserContent::Image(_) => {
+                                    out.push_str("(image)");
+                                }
+                            }
+                            out.push('\n');
+                        }
+                    }
+                }
+            }
+            AgentMessage::Llm(Message::Assistant(assistant)) => {
+                out.push_str("[Assistant]\n");
+                for block in &assistant.content {
+                    match block {
+                        AssistantContent::Text(t) => out.push_str(&t.text),
+                        // Thinking is the model's scratch space, not durable
+                        // context, so skip it when building the summary.
+                        AssistantContent::Thinking(_) => continue,
+                        AssistantContent::ToolCall(tc) => {
+                            out.push_str(&format!("[tool call: {} {}]", tc.name, tc.arguments));
+                        }
+                    }
+                    out.push('\n');
+                }
+            }
+            AgentMessage::Llm(Message::ToolResult(result)) => {
+                out.push_str(&format!("[Tool result: {}]\n", result.tool_name));
+                for block in &result.content {
+                    if let ToolResultContent::Text(t) = block {
+                        let text: String =
+                            t.text.chars().take(SERIALIZED_TOOL_RESULT_CHARS).collect();
+                        out.push_str(&text);
+                        if t.text.len() > text.len() {
+                            out.push_str("\n[...truncated]");
+                        }
+                        out.push('\n');
+                    }
+                }
+            }
+            AgentMessage::Metadata { .. } => continue,
+            AgentMessage::Custom { kind, payload, .. } => {
+                out.push_str(&format!("[{kind}]\n{payload}\n"));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Why compaction failed. The loop treats failures as non fatal (the next
+/// request may still fit, if not, the overflow error reaches the user).
+#[derive(Debug, thiserror::Error)]
+pub enum CompactionError {
+    #[error("nothing to compact")]
+    NothingToCompact,
+    #[error("summarization failed: {message}")]
+    SummarizationFailed {
+        message: String,
+        usage: Option<Box<cupel_core::types::Usage>>,
+    },
+    #[error("summarization refused: {0}")]
+    Refused(String),
+}
+
+impl CompactionError {
+    #[must_use]
+    pub fn usage(&self) -> Option<&cupel_core::types::Usage> {
+        match self {
+            Self::SummarizationFailed { usage, .. } => usage.as_deref(),
+            Self::NothingToCompact | Self::Refused(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompactionOutcome {
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    pub summarized_messages: usize,
+    pub pruned_tool_results: usize,
+    pub summary: Option<String>,
+    pub usage: Option<cupel_core::types::Usage>,
+}
+
+/// Compact `context.messages` in place, cheapest tier first,
+/// 1. elide stale tool result bodies (free) and stop here when that
+///    alone brings the estimate back under the compaction threshold,
+/// 2. otherwise summarize everything before the cut point via one LLM
+///    call, then splice `[summary user message] + kept tail`.
+pub async fn compact(
+    context: &mut AgentContext,
+    registry: &Arc<Registry>,
+    model: &Model,
+    api_key: Option<String>,
+    config: &CompactionConfig,
+    cancel: &CancellationToken,
+) -> Result<CompactionOutcome, CompactionError> {
+    compact_with_hooks(
+        context,
+        registry,
+        model,
+        api_key,
+        config,
+        cancel,
+        &crate::types::NoHooks,
+    )
+    .await
+}
+
+pub async fn compact_with_hooks(
+    context: &mut AgentContext,
+    registry: &Arc<Registry>,
+    model: &Model,
+    api_key: Option<String>,
+    config: &CompactionConfig,
+    cancel: &CancellationToken,
+    hooks: &dyn crate::types::AgentHooks,
+) -> Result<CompactionOutcome, CompactionError> {
+    let tokens_before = estimate_context_tokens(context);
+    let cut = cut_index(context, model.context_window, config)
+        .ok_or(CompactionError::NothingToCompact)?;
+    let config = config.for_context_window(model.context_window);
+
+    // Tier 1, free pruning
+    // Elide only outside the keep window (the recent tail stays verbatim, so
+    // the model may be mid task on those outputs). When this is enough,
+    // return before any LLM call, no summarization cost, no summary at all.
+    let keep: Vec<&str> = context
+        .tools
+        .iter()
+        .filter(|tool| !tool.reproducible())
+        .map(|tool| tool.name())
+        .collect();
+    let pruned_tool_results = elide_stale_tool_results(&mut context.messages[..cut], &keep);
+    if pruned_tool_results > 0 {
+        invalidate_usage_anchors(&mut context.messages);
+        let tokens_after = estimate_context_tokens(context);
+        if !should_compact(tokens_after, model.context_window, &config) {
+            return Ok(CompactionOutcome {
+                tokens_before,
+                tokens_after,
+                summarized_messages: 0,
+                pruned_tool_results,
+                summary: None,
+                usage: None,
+            });
+        }
+    }
+
+    // Tier 2, summarize the (now pruned) old history
+    // The summary is built from the pruned messages, elided bodies cost the
+    // summarization call almost nothing, and the key facts from tool output
+    // live in the assistant's own text anyway.
+    let (to_summarize, kept) = context.messages.split_at(cut);
+
+    // Iterative update, if a previous compaction summary is in the section
+    // being summarized, feed it to the update prompt instead of losing it.
+    let previous_summary = to_summarize.iter().find_map(|m| match m {
+        AgentMessage::Llm(Message::User(user)) => match &user.content {
+            UserContentBody::Text(text) if text.starts_with(COMPACTION_MARKER) => {
+                Some(text[COMPACTION_MARKER.len()..].trim().to_string())
+            }
+            _ => None,
+        },
+        _ => None,
+    });
+
+    // The summarization request
+    let conversation = serialize_conversation(to_summarize);
+    let mut prompt = format!("<conversation>\n{conversation}\n</conversation>\n\n");
+    if let Some(previous) = &previous_summary {
+        prompt.push_str(&format!(
+            "<previous-summary>\n{previous}\n</previous-summary>\n\n"
+        ));
+    }
+    prompt.push_str(if previous_summary.is_some() {
+        UPDATE_SUMMARIZATION_PROMPT
+    } else {
+        SUMMARIZATION_PROMPT
+    });
+
+    // The summary must fit in the reserve (that's what it's reserved for).
+    let max_tokens = (config.reserve_tokens * 8 / 10).min(model.max_tokens.max(1));
+    let summarization_context = Context {
+        system_prompt: Some(SUMMARIZATION_SYSTEM_PROMPT.to_string()),
+        messages: vec![Message::User(cupel_core::types::UserMessage {
+            content: UserContentBody::Text(prompt),
+            timestamp: cupel_core::types::now_ms(),
+        })],
+        tools: None,
+    };
+    if let Some(problem) = hooks.model_request_problem().await {
+        return Err(CompactionError::Refused(problem));
+    }
+    let api_key = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(CompactionError::Refused("cancelled while resolving credentials".into())),
+        key = hooks.api_key(model.provider.as_str()) => key.or(api_key),
+    };
+    let options = StreamOptions {
+        api_key,
+        max_tokens: Some(max_tokens),
+        signal: Some(cancel.clone()),
+        ..StreamOptions::default()
+    };
+
+    let response = match registry
+        .complete(model, summarization_context, options)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let usage = match &error {
+                cupel_core::error::InferenceError::Stream(
+                    cupel_core::error::MessageStreamError::ProviderError { message, .. },
+                ) => Some(message.usage.clone()),
+                _ => None,
+            };
+            hooks.observe_usage(usage.as_ref()).await;
+            return Err(CompactionError::SummarizationFailed {
+                message: error.to_string(),
+                usage: usage.map(Box::new),
+            });
+        }
+    };
+    hooks.observe_usage(Some(&response.usage)).await;
+    let summary: String = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            AssistantContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if summary.trim().is_empty() {
+        return Err(CompactionError::SummarizationFailed {
+            message: "summarization produced no text".into(),
+            usage: Some(Box::new(response.usage)),
+        });
+    }
+
+    // Splice the transcript
+    let summarized_messages = to_summarize.len();
+    let mut new_messages: Vec<_> = to_summarize
+        .iter()
+        .filter(|message| matches!(message, AgentMessage::Metadata { .. }))
+        .cloned()
+        .collect();
+    new_messages.push(AgentMessage::user_text(format!(
+        "{COMPACTION_MARKER}\n\n{summary}"
+    )));
+    new_messages.extend(kept.iter().cloned());
+    context.messages = new_messages;
+    invalidate_usage_anchors(&mut context.messages);
+
+    Ok(CompactionOutcome {
+        tokens_before,
+        tokens_after: estimate_context_tokens(context),
+        summarized_messages,
+        pruned_tool_results,
+        summary: Some(summary),
+        usage: Some(response.usage),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_metadata_never_consumes_context_or_summarizer_input() {
+        let metadata = AgentMessage::metadata(
+            "archive",
+            serde_json::json!({"full_answer": "LOCAL_ARCHIVE_SENTINEL".repeat(100_000)}),
+            1,
+        );
+        assert_eq!(estimate_message_tokens(&metadata), 0);
+        let ordinary = user("ordinary conversation");
+        assert_eq!(
+            serialize_conversation(&[metadata.clone(), ordinary.clone()]),
+            serialize_conversation(&[ordinary]),
+        );
+        let context = AgentContext {
+            system_prompt: String::new(),
+            messages: vec![metadata.clone()],
+            tools: Vec::new(),
+        };
+        assert_eq!(estimate_context_tokens(&context), 0);
+        assert_eq!(
+            cut_index(&context, 4096, &CompactionConfig::default()),
+            None
+        );
+        let decoded: AgentMessage =
+            serde_json::from_str(&serde_json::to_string(&metadata).unwrap()).unwrap();
+        assert_eq!(decoded, metadata);
+        assert!(matches!(decoded, AgentMessage::Metadata { .. }));
+    }
+
+    #[test]
+    fn legacy_custom_records_remain_distinct_from_local_metadata() {
+        let custom = AgentMessage::Custom {
+            kind: "custom-application-data".into(),
+            payload: serde_json::json!({"value":"application may summarize this"}),
+            timestamp: 1,
+        };
+        let decoded: AgentMessage =
+            serde_json::from_str(&serde_json::to_string(&custom).unwrap()).unwrap();
+        assert_eq!(decoded, custom);
+        assert!(matches!(decoded, AgentMessage::Custom { .. }));
+        assert!(estimate_message_tokens(&decoded) > 0);
+    }
+
+    fn user(text: &str) -> AgentMessage {
+        AgentMessage::user_text(text)
+    }
+
+    #[test]
+    fn budgets_scale_with_context_window() {
+        let config = CompactionConfig::default();
+        for (window, budget) in [
+            (0, 0),
+            (4096, 1024),
+            (8192, 2048),
+            (16_384, 4096),
+            (65_536, 16_384),
+            (100_000, 16_384),
+        ] {
+            let effective = config.for_context_window(window);
+            assert_eq!(effective.reserve_tokens, budget, "window {window}");
+            assert_eq!(effective.keep_recent_tokens, budget, "window {window}");
+        }
+    }
+
+    #[test]
+    fn smaller_explicit_budgets_are_preserved() {
+        let config = CompactionConfig {
+            enabled: true,
+            reserve_tokens: 512,
+            keep_recent_tokens: 256,
+        };
+        assert_eq!(config.for_context_window(4096), config);
+    }
+
+    #[test]
+    fn threshold_scales_with_small_context_windows() {
+        let config = CompactionConfig::default();
+        for window in [4096, 8192, 16_384] {
+            let threshold = window - window / 4;
+            assert!(!should_compact(0, window, &config));
+            assert!(!should_compact(threshold, window, &config));
+            assert!(should_compact(threshold + 1, window, &config));
+        }
+        assert!(!should_compact(1000, 0, &config));
+    }
+
+    #[test]
+    fn threshold_respects_reserve() {
+        let config = CompactionConfig::default();
+        // Window 100k, reserve ~16k, 80k is fine, 90k must compact.
+        assert!(!should_compact(80_000, 100_000, &config));
+        assert!(should_compact(90_000, 100_000, &config));
+        // Disabled never compacts.
+        let disabled = CompactionConfig {
+            enabled: false,
+            ..config
+        };
+        assert!(!should_compact(90_000, 100_000, &disabled));
+    }
+
+    #[test]
+    fn cut_index_lands_on_a_user_boundary() {
+        // ~1000 tokens each (4000 chars), keep budget of 1500 tokens should
+        // keep roughly the last two messages, cutting at the user boundary.
+        let big = "x".repeat(4000);
+        let messages = vec![user(&big), user(&big), user(&big), user(&big)];
+        let cut = find_cut_index(&messages, 1500);
+        assert_eq!(cut, 2);
+    }
+
+    #[test]
+    fn cut_index_zero_when_everything_fits_budget() {
+        let messages = vec![user("short"), user("also short")];
+        assert_eq!(find_cut_index(&messages, 20_000), 0);
+    }
+
+    #[test]
+    fn cut_index_uses_model_sized_keep_window() {
+        let big = "x".repeat(4000);
+        let mut context = AgentContext {
+            system_prompt: String::new(),
+            messages: vec![user(&big), user(&big), user(&big), user(&big)],
+            tools: Vec::new(),
+        };
+        let config = CompactionConfig::default();
+        assert_eq!(cut_index(&context, 4096, &config), Some(2));
+        assert_eq!(cut_index(&context, 100_000, &config), None);
+        context.messages.clear();
+        assert_eq!(cut_index(&context, 4096, &config), None);
+    }
+
+    #[test]
+    fn cut_index_preserves_tool_pairs_without_a_user_boundary() {
+        let model = model_with_window(0);
+        let mut messages = vec![user("read the files")];
+        messages.extend((0..4).flat_map(|i| {
+            let id = format!("call_{i}");
+            [
+                AgentMessage::Llm(Message::Assistant(cupel_core::types::AssistantMessage {
+                    content: vec![AssistantContent::ToolCall(cupel_core::types::ToolCall {
+                        id: id.clone(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({}),
+                    })],
+                    api: model.api.clone(),
+                    provider: model.provider.clone(),
+                    model: model.id.clone(),
+                    response_model: None,
+                    response_id: None,
+                    usage: cupel_core::types::Usage::default(),
+                    stop_reason: cupel_core::types::StopReason::ToolUse,
+                    error_message: None,
+                    error_kind: None,
+                    timestamp: 0,
+                })),
+                AgentMessage::Llm(Message::ToolResult(cupel_core::types::ToolResultMessage {
+                    tool_call_id: id,
+                    tool_name: "read".into(),
+                    content: vec![ToolResultContent::Text(
+                        cupel_core::types::TextContent::plain("y".repeat(4000)),
+                    )],
+                    details: None,
+                    is_error: false,
+                    timestamp: 0,
+                })),
+            ]
+        }));
+
+        for budget_start in 1..messages.len() {
+            // This budget lands exactly on the selected message, with no
+            // user/custom boundary remaining in the keep window.
+            let keep_recent_tokens = messages[budget_start..]
+                .iter()
+                .map(estimate_message_tokens)
+                .sum();
+            let cut = find_cut_index(&messages, keep_recent_tokens);
+            // Assistant boundaries stay put, result boundaries advance to
+            // the next assistant (or the end when no assistant remains).
+            let expected_cut = if budget_start % 2 == 0 {
+                budget_start + 1
+            } else {
+                budget_start
+            };
+            assert_eq!(cut, expected_cut, "budget starts at {budget_start}");
+            assert!(
+                cut == messages.len()
+                    || matches!(messages[cut], AgentMessage::Llm(Message::Assistant(_)))
+            );
+        }
+    }
+
+    fn tool_result(bytes: usize) -> AgentMessage {
+        AgentMessage::Llm(Message::ToolResult(cupel_core::types::ToolResultMessage {
+            tool_call_id: "c".into(),
+            tool_name: "read".into(),
+            content: vec![ToolResultContent::Text(
+                cupel_core::types::TextContent::plain("y".repeat(bytes)),
+            )],
+            details: Some(serde_json::json!({"lines": 1})),
+            is_error: false,
+            timestamp: 0,
+        }))
+    }
+
+    fn result_text(message: &AgentMessage) -> &str {
+        let AgentMessage::Llm(Message::ToolResult(result)) = message else {
+            panic!("not a tool result");
+        };
+        match &result.content[0] {
+            ToolResultContent::Text(t) => &t.text,
+            ToolResultContent::Image(_) => panic!("unexpected image"),
+        }
+    }
+
+    #[test]
+    fn pruning_elides_large_results_and_spares_small_ones() {
+        let mut messages = vec![tool_result(10_000), tool_result(100), user("keep me")];
+        let pruned = elide_stale_tool_results(&mut messages, &[]);
+        assert_eq!(pruned, 1, "only the large result is elided");
+        assert_eq!(result_text(&messages[0]), ELIDED_TOOL_RESULT);
+        assert_eq!(result_text(&messages[1]).len(), 100, "small one intact");
+        // Idempotent, the stub itself is below the size floor.
+        assert_eq!(elide_stale_tool_results(&mut messages, &[]), 0);
+    }
+
+    /// A model whose api has no registered provider, any summarization
+    /// attempt errors, so an Ok result proves no LLM call happened.
+    fn model_with_window(context_window: u64) -> Model {
+        Model {
+            id: "mock".into(),
+            name: "Mock".into(),
+            api: cupel_core::types::Api::from("unregistered"),
+            provider: cupel_core::types::Provider::from("mock"),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![cupel_core::types::InputModality::Text],
+            cost: cupel_core::types::ModelCost::default(),
+            context_window,
+            max_context_window: None,
+            max_tokens: 4096,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pruning_alone_can_avoid_the_summarization_call() {
+        // ~10k estimated tokens of tool output before a tiny keep window,
+        // window 6k with reserve 1k → threshold 5k. Pruning drops the
+        // estimate to almost nothing, so tier 2 must not run. This is proven by
+        // the empty registry, where any LLM call would error.
+        let mut context = AgentContext {
+            system_prompt: String::new(),
+            messages: vec![
+                user("old question"),
+                tool_result(40_000),
+                user("recent question"),
+            ],
+            tools: Vec::new(),
+        };
+        let config = CompactionConfig {
+            enabled: true,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 100,
+        };
+        let outcome = compact(
+            &mut context,
+            &Arc::new(Registry::new()),
+            &model_with_window(6_000),
+            None,
+            &config,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("pruning suffices - no LLM needed");
+
+        assert_eq!(outcome.pruned_tool_results, 1);
+        assert_eq!(outcome.summarized_messages, 0, "tier 2 skipped");
+        assert!(outcome.tokens_after < outcome.tokens_before);
+        assert_eq!(result_text(&context.messages[1]), ELIDED_TOOL_RESULT);
+        // The kept tail and the old user message survive untouched.
+        assert_eq!(context.messages.len(), 3);
+    }
+
+    /// A tool that can't repeat its result, like a question to the user.
+    struct Unrepeatable;
+
+    #[async_trait::async_trait]
+    impl crate::types::AgentTool for Unrepeatable {
+        fn name(&self) -> &str {
+            "ask_user"
+        }
+        fn description(&self) -> &str {
+            "asks the user"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn reproducible(&self) -> bool {
+            false
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _args: serde_json::Value,
+            _cancel: CancellationToken,
+            _on_update: Option<crate::types::ToolUpdateFn>,
+        ) -> Result<crate::types::AgentToolResult, crate::types::ToolError> {
+            Ok(crate::types::AgentToolResult::text("an answer"))
+        }
+    }
+
+    #[tokio::test]
+    async fn pruning_spares_results_a_tool_cannot_repeat() {
+        // Above the 256 byte floor, so only `keep` can save it.
+        let mut answer = tool_result(1_000);
+        if let AgentMessage::Llm(Message::ToolResult(result)) = &mut answer {
+            result.tool_name = "ask_user".into();
+        }
+        let tool: Arc<dyn crate::types::AgentTool> = Arc::new(Unrepeatable);
+        let mut context = AgentContext {
+            system_prompt: String::new(),
+            messages: vec![
+                user("old question"),
+                answer,
+                tool_result(40_000),
+                user("recent question"),
+            ],
+            tools: vec![tool],
+        };
+        let config = CompactionConfig {
+            enabled: true,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 100,
+        };
+        let outcome = compact(
+            &mut context,
+            &Arc::new(Registry::new()),
+            &model_with_window(6_000),
+            None,
+            &config,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("pruning suffices - no LLM needed");
+
+        assert_eq!(outcome.pruned_tool_results, 1, "only the read result goes");
+        assert_eq!(
+            result_text(&context.messages[1]).len(),
+            1_000,
+            "the answer stays"
+        );
+        assert_eq!(result_text(&context.messages[2]), ELIDED_TOOL_RESULT);
+    }
+
+    #[tokio::test]
+    async fn insufficient_pruning_still_reaches_the_summarizer() {
+        // The bulk is user text, which pruning cannot touch. The estimate
+        // stays over the threshold, so tier 2 runs and (empty registry)
+        // fails with SummarizationFailed, proof the LLM call was attempted.
+        let big = "x".repeat(40_000);
+        let mut context = AgentContext {
+            system_prompt: String::new(),
+            messages: vec![user(&big), tool_result(10_000), user("recent")],
+            tools: Vec::new(),
+        };
+        let config = CompactionConfig {
+            enabled: true,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 100,
+        };
+        let err = compact(
+            &mut context,
+            &Arc::new(Registry::new()),
+            &model_with_window(6_000),
+            None,
+            &config,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("still over threshold - summarization attempted");
+        assert!(matches!(err, CompactionError::SummarizationFailed { .. }));
+        // Tier 1 still did its (kept) work before tier 2 failed.
+        assert_eq!(result_text(&context.messages[1]), ELIDED_TOOL_RESULT);
+    }
+
+    struct RefuseRequests;
+    #[async_trait::async_trait]
+    impl crate::types::AgentHooks for RefuseRequests {
+        async fn model_request_problem(&self) -> Option<String> {
+            Some("budget exhausted".into())
+        }
+        async fn api_key(&self, _: &str) -> Option<String> {
+            panic!("refused requests must not refresh credentials")
+        }
+    }
+
+    #[tokio::test]
+    async fn summarization_obeys_provider_admission_before_credentials() {
+        let mut context = AgentContext {
+            system_prompt: String::new(),
+            messages: vec![
+                user(&"x".repeat(40_000)),
+                tool_result(10_000),
+                user("recent"),
+            ],
+            tools: Vec::new(),
+        };
+        let config = CompactionConfig {
+            enabled: true,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 100,
+        };
+        let error = compact_with_hooks(
+            &mut context,
+            &Arc::new(Registry::new()),
+            &model_with_window(6000),
+            None,
+            &config,
+            &CancellationToken::new(),
+            &RefuseRequests,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, CompactionError::Refused(_)));
+    }
+
+    #[test]
+    fn serialization_truncates_tool_results() {
+        let long_result =
+            AgentMessage::Llm(Message::ToolResult(cupel_core::types::ToolResultMessage {
+                tool_call_id: "c".into(),
+                tool_name: "bash".into(),
+                content: vec![ToolResultContent::Text(
+                    cupel_core::types::TextContent::plain("y".repeat(10_000)),
+                )],
+                details: None,
+                is_error: false,
+                timestamp: 0,
+            }));
+        let text = serialize_conversation(&[long_result]);
+        assert!(text.contains("[...truncated]"));
+        assert!(text.len() < 5_000);
+    }
+}

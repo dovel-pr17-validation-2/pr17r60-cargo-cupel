@@ -1,0 +1,377 @@
+//! Session ingredients, everything a fresh agent session loads from disk,
+//! assembled in one place so startup (`run`) and the TUI's
+//! hot reload produce byte identical results. Before this module the
+//! assembly lived inline in main.rs. Hot reload would have had to copy
+//! it, and the two paths would drift.
+
+use async_trait::async_trait;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use cupel_agent::AgentHooks;
+use cupel_agent::types::{AgentTool, BeforeToolCallResult};
+use cupel_core::types::{AssistantMessage, Model, ToolCall};
+
+use crate::commands::PromptTemplate;
+use crate::guard::BashGuard;
+use crate::loop_killer::LoopKiller;
+use crate::search::GrepSearch;
+use crate::settings::Settings;
+use crate::system_prompt::build_system_prompt;
+use crate::tools::{
+    apply_patch::ApplyPatchTool,
+    ask_user::{AskUserTool, QuestionReceiver},
+    bash::BashTool,
+    grep::GrepTool,
+    read::ReadTool,
+};
+
+/// Name + one line snippet per tool for the system prompt (full
+/// descriptions travel in the tool schemas).
+pub const TOOL_SUMMARIES: &[(&str, &str)] = &[
+    ("read", "Read file contents"),
+    ("bash", "Execute bash commands (ls, find, cargo, etc.)"),
+    (
+        "apply_patch",
+        "Create, delete, rename, and patch files with one *** Begin Patch / *** End Patch \
+        envelope",
+    ),
+    (
+        "grep",
+        "Search file contents for patterns (respects .gitignore)",
+    ),
+    (
+        "ask_user",
+        "Ask the user to decide a design question: two or more options, one recommended",
+    ),
+];
+
+/// Which frontend a session runs in. Only the TUI can answer a question while a run
+/// waits for it, so only the TUI gets the `ask_user` tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Frontend {
+    Plain,
+    Tui,
+}
+
+/// The reloadable parts of a session, all derived from `~/.cupel` +
+/// `<cwd>/.cupel` + the cwd itself.
+pub struct Ingredients {
+    pub system_prompt: String,
+    pub tools: Vec<Arc<dyn AgentTool>>,
+    pub templates: Vec<PromptTemplate>,
+    pub models: Vec<Model>,
+    pub hooks: SessionHooks,
+    pub settings: Settings,
+    pub context_files: Vec<crate::resources::ContextFile>,
+    pub warnings: Vec<String>,
+    pub questions: Option<QuestionReceiver>,
+}
+
+impl Ingredients {
+    /// Startup and every reload bind both the tool and hooks to the recorder's
+    /// journal. Unbound tools remain useful for standalone callers and tests.
+    pub fn bind_session(&mut self, recorder: &crate::session::SessionRecorder, cwd: &Path) {
+        let undo = recorder.undo();
+        for tool in &mut self.tools {
+            if tool.name() == "apply_patch" {
+                *tool = Arc::new(ApplyPatchTool::new(cwd).with_undo(Arc::clone(&undo)));
+            }
+        }
+        self.hooks.undo = Some(undo);
+    }
+}
+
+/// Load every ingredient fresh from disk (and the bounded ollama probe).
+/// Parameterized on `home` instead of reading `CUPEL_HOME` so hot reload
+/// and tests share the exact code path with startup.
+pub async fn load(
+    cwd: &Path,
+    home: Option<PathBuf>,
+    registry: &cupel_core::provider::Registry,
+    frontend: Frontend,
+) -> Ingredients {
+    let roots = crate::resources::roots_for(home.clone(), cwd);
+    let context_files = crate::resources::load_context_files(&roots);
+    let templates = crate::commands::load_prompt_templates(&roots);
+    let (home_settings, mut warnings) = crate::settings::load_home_settings(home.as_deref());
+    let (project_settings, project_warnings) = crate::settings::load_project_settings(cwd);
+    warnings.extend(project_warnings);
+    warnings.extend(crate::settings::project_settings_warning(cwd));
+    let (models, model_warnings) =
+        crate::models::build_catalog(registry, home.as_deref(), cwd, &home_settings).await;
+    warnings.extend(model_warnings);
+    let (guard, guard_warnings) = BashGuard::from_config(home.as_deref(), cwd);
+    warnings.extend(guard_warnings);
+    let settings = Settings::layered(home_settings, project_settings);
+    let hooks = SessionHooks::new(
+        guard,
+        LoopKiller::new(settings.loop_killer_max_repeats()),
+        home.clone(),
+    );
+
+    let mut tools = coding_tools(cwd);
+    let questions = match frontend {
+        Frontend::Tui => {
+            let (tool, questions) = AskUserTool::new();
+            tools.push(Arc::new(tool));
+            Some(questions)
+        }
+        Frontend::Plain => None,
+    };
+    // The prompt lists the tools this session has, and no others.
+    let summaries: Vec<(&str, &str)> = TOOL_SUMMARIES
+        .iter()
+        .copied()
+        .filter(|(name, _)| tools.iter().any(|tool| tool.name() == *name))
+        .collect();
+
+    Ingredients {
+        system_prompt: build_system_prompt(cwd, &summaries, &context_files),
+        context_files,
+        tools,
+        templates,
+        models,
+        hooks,
+        settings,
+        warnings,
+        questions,
+    }
+}
+
+/// The coding tools available to a session.
+#[must_use]
+pub fn coding_tools(cwd: &Path) -> Vec<Arc<dyn AgentTool>> {
+    let backend = Arc::new(GrepSearch::new(cwd));
+    vec![
+        Arc::new(ReadTool::new(cwd)),
+        Arc::new(BashTool::new(cwd)),
+        Arc::new(ApplyPatchTool::new(cwd)),
+        Arc::new(GrepTool::new(cwd, backend)),
+    ]
+}
+
+/// The one [`AgentHooks`] object a session runs with, the bash guard and
+/// the loop killer behind a single trait object (`AgentOptions.hooks`
+/// holds exactly one). Fans out only `before_tool_call`, the sole hook
+/// either member cares about, every other AgentHooks method keeps its
+/// trait default. Extend the fan out when a member grwos a new hook.
+pub struct SessionHooks {
+    guard: BashGuard,
+    loop_killer: LoopKiller,
+    home: Option<PathBuf>,
+    http: reqwest::Client,
+    undo: Option<Arc<crate::undo::UndoJournal>>,
+}
+
+impl SessionHooks {
+    #[must_use]
+    pub fn new(guard: BashGuard, loop_killer: LoopKiller, home: Option<PathBuf>) -> Self {
+        Self {
+            guard,
+            loop_killer,
+            home,
+            http: reqwest::Client::new(),
+            undo: None,
+        }
+    }
+}
+
+#[async_trait]
+impl AgentHooks for SessionHooks {
+    async fn on_user_messages(&self, messages: &[cupel_agent::AgentMessage]) {
+        if messages.iter().any(|message| {
+            matches!(
+                message,
+                cupel_agent::AgentMessage::Llm(cupel_core::types::Message::User(_))
+            )
+        }) && let Some(undo) = &self.undo
+        {
+            undo.begin_turn().await;
+        }
+    }
+
+    /// The agent loop calls this before every provider request (types.rs,
+    /// "Resolve an API key for a provider right before each call"). The
+    /// designed home for expiring OAuth tokens. Key based providers
+    /// return None here and keep riding AgentOptions.api_key.
+    async fn api_key(&self, provider: &str) -> Option<String> {
+        if provider != cupel_core::types::Provider::OPENAI_CODEX {
+            return None;
+        }
+        crate::auth::openai_codex_access_token(self.home.as_deref(), &self.http).await
+    }
+    async fn before_tool_call(
+        &self,
+        assistant: &AssistantMessage,
+        tool_call: &ToolCall,
+    ) -> Option<BeforeToolCallResult> {
+        // The killer observes every request call first, including ones
+        // the guard is about to veto, a model hammering a denied bash
+        // command is looping too, and each guard block would otherwise
+        // reset nothing while the loop spins forever. Once the killer
+        // trips, its message takes over, "take a different approach"
+        // redirects harder than the guard's per command veto, which is
+        // exactly what a stuck model needs to hear.
+        if let Some(reason) = self.loop_killer.note_call(tool_call) {
+            return Some(BeforeToolCallResult {
+                block: true,
+                reason: Some(reason),
+            });
+        }
+        self.guard.before_tool_call(assistant, tool_call).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[tokio::test]
+    async fn load_picks_up_every_cupel_layer() {
+        let root = std::env::temp_dir().join("cupel-bootstrap-load");
+        let _ = std::fs::remove_dir_all(&root);
+        let (home, cwd) = (root.join("home"), root.join("proj"));
+        std::fs::create_dir_all(home.join("prompts")).unwrap();
+        std::fs::create_dir_all(cwd.join(".cupel")).unwrap();
+        std::fs::write(home.join("AGENTS.md"), "ALWAYS SAY PING").unwrap();
+        std::fs::write(home.join("prompts/greet.md"), "Greet $1.").unwrap();
+        std::fs::write(
+            cwd.join(".cupel/settings.json"),
+            r#"{"loopKiller": {"maxRepeats": 2}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join(".cupel/models.json"),
+            serde_json::json!([{
+                "id": "local-test", "name": "Local", "api": "openai-completions",
+                "provider": "test-local", "baseUrl": "http://localhost:9/v1",
+                "reasoning": false, "input": ["text"],
+                "cost": {"input": 0, "output": 0, "cachedRead": 0, "cachedWrite": 0},
+                "contextWindow": 4096, "maxTokens": 4096,
+                "compat": {"requiresApiKey": false}
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(cwd.join(".cupel/bash-deny"), "git\\s+push\\s+--force\n").unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            r#"{"providers": {"test-local": "k-1"}}"#,
+        )
+        .unwrap();
+
+        let registry = cupel_core::default_registry();
+        let restricted = load(&cwd, Some(home.clone()), &registry, Frontend::Plain).await;
+        assert!(!restricted.models.iter().any(|m| m.id == "local-test"));
+        crate::project_trust::save(&home, &cwd, crate::project_trust::ProjectTrust::Trusted)
+            .unwrap();
+        let ingredients = load(&cwd, Some(home), &registry, Frontend::Plain).await;
+
+        assert!(ingredients.system_prompt.contains("ALWAYS SAY PING"));
+        assert!(ingredients.templates.iter().any(|t| t.name == "greet"));
+        assert!(ingredients.models.iter().any(|m| m.id == "local-test"));
+        assert_eq!(ingredients.tools.len(), 4);
+        assert!(ingredients.warnings.is_empty());
+        assert_eq!(ingredients.settings.api_key("test-local"), Some("k-1"));
+        assert_eq!(ingredients.settings.loop_killer_max_repeats(), Some(2));
+        assert_eq!(ingredients.settings.api_key("test-local"), Some("k-1"));
+        // The guard carries defaults and the project rule.
+        // (Verified through the public hook in guard.rs tests, here the
+        // cheap signal is that construction succeeded with both layers.)
+    }
+
+    #[tokio::test]
+    async fn load_collects_warnings_from_both_config_layers_once() {
+        let root = std::env::temp_dir().join("cupel-bootstrap-warnings");
+        let _ = std::fs::remove_dir_all(&root);
+        let (home, cwd) = (root.join("home"), root.join("proj"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(cwd.join(".cupel")).unwrap();
+        let broken_files = [
+            home.join("settings.json"),
+            cwd.join(".cupel/settings.json"),
+            home.join("models.json"),
+            cwd.join(".cupel/models.json"),
+        ];
+        for path in &broken_files {
+            std::fs::write(path, "{broken").unwrap();
+        }
+        std::fs::write(home.join("bash-deny"), "[home-rule\n").unwrap();
+        std::fs::write(cwd.join(".cupel/bash-deny"), "[project-rule\n").unwrap();
+
+        let registry = cupel_core::default_registry();
+        let ingredients = load(&cwd, Some(home.clone()), &registry, Frontend::Plain).await;
+        assert_eq!(ingredients.settings, Settings::default());
+        assert_eq!(ingredients.warnings.len(), 6, "{:?}", ingredients.warnings);
+        for path in broken_files {
+            assert_eq!(
+                ingredients
+                    .warnings
+                    .iter()
+                    .filter(|warning| { warning.contains(&path.display().to_string()) })
+                    .count(),
+                1,
+                "each broken layer is reported once"
+            );
+        }
+        for pattern in ["[home-rule", "[project-rule"] {
+            assert!(
+                ingredients
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(pattern))
+            );
+        }
+
+        // Project credentials remain ignored and the notice never includes keys.
+        std::fs::write(
+            cwd.join(".cupel/settings.json"),
+            r#"{"providers":{"fixture":"do-not-display-this-key"}}"#,
+        )
+        .unwrap();
+        let ingredients = load(&cwd, Some(home), &registry, Frontend::Plain).await;
+        assert_eq!(ingredients.settings.api_key("fixture"), None);
+        assert!(
+            ingredients
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("API keys belong"))
+        );
+        assert!(
+            ingredients
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("do-not-display-this-key"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_the_tui_gets_the_ask_user_tool() {
+        let root = std::env::temp_dir().join("cupel-bootstrap-ask-user");
+        let _ = std::fs::remove_dir_all(&root);
+        let (home, cwd) = (root.join("home"), root.join("proj"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let registry = cupel_core::default_registry();
+
+        let tui = load(&cwd, Some(home.clone()), &registry, Frontend::Tui).await;
+        assert!(tui.tools.iter().any(|tool| tool.name() == "ask_user"));
+        assert!(tui.questions.is_some());
+        assert!(tui.system_prompt.contains("- ask_user: Ask the user"));
+        // The whole guideline, so a line break from a wrapped literal shows.
+        assert!(tui.system_prompt.contains(
+            "- Use ask_user when a design decision is the user's to make and several options \
+             are reasonable, and recommend one of them; don't ask what the code, the project \
+             instructions, or an earlier answer already tells you.\n"
+        ));
+
+        let plain = load(&cwd, Some(home), &registry, Frontend::Plain).await;
+        assert!(plain.tools.iter().all(|tool| tool.name() != "ask_user"));
+        assert!(plain.questions.is_none());
+        assert!(!plain.system_prompt.contains("ask_user"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

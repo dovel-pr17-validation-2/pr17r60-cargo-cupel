@@ -1,0 +1,1006 @@
+//! The low level agent loop, stream an assistant response, execute its tool
+//! calls, feed the results back, repeat until the model stops asking for
+//! tools (and no queued messages remain).
+//!
+//! Cloning the whole message per delta is
+//! wasteful in Rust, instead `MessageUpdate` carries the raw
+//! provider event and consumers accumulate exactly the state they render.
+
+use std::sync::Arc;
+
+use futures_util::StreamExt as _;
+use serde_json::Value;
+use tokio_util::sync::CancellationToken;
+
+use cupel_core::{
+    error::{InferenceError, MessageStreamError},
+    provider::Registry,
+    types::{
+        AssistantContent, AssistantMessage, AssistantMessageEvent, Context, ErrorKind, Message,
+        StopReason, StreamOptions, Tool, ToolCall, ToolResultMessage, now_ms,
+    },
+};
+
+use crate::compaction;
+use crate::types::{
+    AgentContext, AgentEvent, AgentHooks, AgentLoopConfig, AgentMessage, AgentTool,
+    AgentToolResult, CompactionReason, ToolExecutionMode, ToolUpdateFn,
+};
+
+/// Consumer handle for a run's events. `AgentEnd` is the final event.
+pub struct AgentEventStream {
+    rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+}
+
+impl futures_core::Stream for AgentEventStream {
+    type Item = AgentEvent;
+    fn poll_next(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+/// Producer handle used inside the loop. Cloneable so concurrent tool
+/// executions can emit events too.
+#[derive(Clone)]
+pub struct AgentEventSink {
+    tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+}
+
+impl AgentEventSink {
+    pub fn emit(&self, event: AgentEvent) {
+        let _ = self.tx.send(event);
+    }
+}
+
+#[must_use]
+pub fn agent_event_channel() -> (AgentEventStream, AgentEventSink) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (AgentEventStream { rx }, AgentEventSink { tx })
+}
+
+/// Returns all new messages the run produced (prompts included).
+pub async fn agent_loop(
+    prompts: Vec<AgentMessage>,
+    mut context: AgentContext,
+    config: AgentLoopConfig,
+    hooks: Arc<dyn AgentHooks>,
+    registry: Arc<Registry>,
+    cancel: CancellationToken,
+    sink: AgentEventSink,
+) -> Vec<AgentMessage> {
+    let cancel = cancel.child_token();
+    let _bridge = CancellationBridge(hooks.cancellation_token().map(|scoped| {
+        let cancel = cancel.clone();
+        tokio::spawn(async move { tokio::select! { () = scoped.cancelled() => cancel.cancel(), () = cancel.cancelled() => {} } })
+    }));
+    let mut new_messages: Vec<AgentMessage> = prompts.clone();
+    context.messages.extend(prompts.iter().cloned());
+    hooks.on_user_messages(&prompts).await;
+
+    for prompt in &prompts {
+        sink.emit(AgentEvent::MessageEnd {
+            message: prompt.clone(),
+        });
+    }
+
+    run_loop(
+        context,
+        &mut new_messages,
+        config,
+        hooks,
+        registry,
+        cancel,
+        &sink,
+    )
+    .await;
+
+    sink.emit(AgentEvent::AgentEnd {
+        messages: new_messages.clone(),
+    });
+    new_messages
+}
+
+struct CancellationBridge(Option<tokio::task::JoinHandle<()>>);
+impl Drop for CancellationBridge {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+#[tracing::instrument(name = "agent_run", skip_all, fields(
+    model = %config.model.id,
+    session_id = config.session_id.as_deref().unwrap_or("")
+))]
+async fn run_loop(
+    mut context: AgentContext,
+    new_messages: &mut Vec<AgentMessage>,
+    config: AgentLoopConfig,
+    hooks: Arc<dyn AgentHooks>,
+    registry: Arc<Registry>,
+    cancel: CancellationToken,
+    sink: &AgentEventSink,
+) {
+    let mut first_turn = true;
+    // Consecutive transient failure retries so far, any successful response
+    // resets it.
+    let mut retry_attempt: u32 = 0;
+    // Guard for reactive overflow compaction, at most once per failure
+    // episode, or a provider that keeps rejecting would loop forever.
+    let mut overflow_compacted = false;
+    // Same guard for stripping stale thinking blocks (see below).
+    let mut thinking_stripped = false;
+    // The user may have queued steering input while the previous run wound
+    // down, check before the first request.
+    let mut pending_messages = hooks.steering_messages().await;
+
+    // Outer loop, restarts when follow up messages arrive after the agent
+    // would otherwise stop.
+    loop {
+        let mut has_more_tool_calls = true;
+
+        // Inner loop, one iteration = one "turn" (assistant response plus
+        // its tool executions).
+        while has_more_tool_calls || !pending_messages.is_empty() {
+            if first_turn {
+                first_turn = false;
+            }
+
+            // TODO, Cost reducition due to `.clone()`
+            // Inject queued messages before the next assistant response.
+            if !pending_messages.is_empty() {
+                hooks.on_user_messages(&pending_messages).await;
+            }
+            for message in pending_messages.drain(..) {
+                context.messages.push(message.clone());
+                new_messages.push(message.clone());
+                sink.emit(AgentEvent::MessageEnd { message });
+            }
+
+            // Compact before the request that would overflow, not after it
+            // fails, cheaper (no wasted request) and invisible to the model.
+            let request_messages = hooks.request_messages().await;
+            let estimate = compaction::estimate_request_tokens(&context, &request_messages);
+            let mut private_config = config.clone();
+            if config.model.context_window > 0 {
+                let reserved: u64 = request_messages
+                    .iter()
+                    .map(compaction::estimate_message_tokens)
+                    .sum();
+                private_config.model.context_window =
+                    config.model.context_window.saturating_sub(reserved).max(1);
+            }
+            if compaction::should_compact(estimate, config.model.context_window, &config.compaction)
+            {
+                run_compaction(
+                    &mut context,
+                    &private_config,
+                    &hooks,
+                    &registry,
+                    &cancel,
+                    sink,
+                    CompactionReason::Threshold,
+                )
+                .await;
+            }
+
+            sink.emit(AgentEvent::TurnStart);
+
+            // This reply's own token. A child token is cancelled with its parent (Esc
+            // still stops everything) but can also be cancelled alone. Steering does
+            // that, and the run goes on.
+            let turn = cancel.child_token();
+            let message = stream_assistant_response(
+                &mut context,
+                &config,
+                &hooks,
+                &registry,
+                &turn,
+                sink,
+                &request_messages,
+            )
+            .await;
+            new_messages.push(AgentMessage::Llm(Message::Assistant(message.clone())));
+
+            // Steering cut this reply short. The partial reply stays in the transcript
+            // but never goes over the wire again (aborted turns are skipped when
+            // messages are converted for the provider). Its tool calls were never
+            // executed. The next request carries the steering messages instead.
+            if message.stop_reason == StopReason::Aborted
+                && turn.is_cancelled()
+                && !cancel.is_cancelled()
+            {
+                tracing::info!("reply interrupted by steering");
+                sink.emit(AgentEvent::TurnEnd {
+                    message: Box::new(AgentMessage::Llm(Message::Assistant(message.clone()))),
+                    tool_results: Vec::new(),
+                });
+                pending_messages = hooks.steering_messages().await;
+                // Request again even if the user took the message back in the
+                // meantime, the interrupted reply still needs an answer.
+                has_more_tool_calls = true;
+                continue;
+            }
+
+            if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+                tracing::warn!(
+                    stop_reason = ?message.stop_reason,
+                    error = message.error_message.as_deref().unwrap_or(""),
+                    "turn failed"
+                );
+                sink.emit(AgentEvent::TurnEnd {
+                    message: Box::new(AgentMessage::Llm(Message::Assistant(message.clone()))),
+                    tool_results: Vec::new(),
+                });
+
+                // The pre turn estimate is a heuristic, when it undershoots,
+                // the provider rejects the request as too large. That error
+                // is checked before transient retry. The waiting and resending the same oversized
+                // request could never succeed. Compact, then re request
+                // immediately (no backoff, the failure wasn't load related).
+                if cupel_core::overflow::is_context_overflow(&message, config.model.context_window)
+                    && config.compaction.enabled
+                    && !overflow_compacted
+                    && !cancel.is_cancelled()
+                {
+                    let compacted = run_compaction(
+                        &mut context,
+                        &private_config,
+                        &hooks,
+                        &registry,
+                        &cancel,
+                        sink,
+                        CompactionReason::Overflow,
+                    )
+                    .await;
+                    if compacted {
+                        overflow_compacted = true;
+                        has_more_tool_calls = true;
+                        continue;
+                    }
+                    // Compaction failed or found nothing to cut, fall through
+                    // to normal error handling.
+                }
+
+                // Preserved thinking, a thinking block is only valid in the
+                // conversation that produced it. After cupel edited that
+                // conversation (compaction, a resumed session's new date
+                // line), the provider rejects every replayed block, and
+                // resending the same request fails the same way. Drop the
+                // thinking blocks (text and tool calls stay) and re request
+                // immediately, once per failure episode. The anthropic
+                // provider avoids this 400 where it can (`drop_block`), this
+                // covers the rest (Sonnet 5.5's `between_tools`, Bedrock).
+                if cupel_core::retry::is_thinking_binding_mismatch(&message)
+                    && !thinking_stripped
+                    && !cancel.is_cancelled()
+                    && strip_thinking_blocks(&mut context)
+                {
+                    sink.emit(AgentEvent::ThinkingBlocksRemoved {
+                        messages: context.messages.clone(),
+                    });
+                    tracing::warn!(
+                        "thinking blocks bound to an edited history; retrying without them"
+                    );
+                    thinking_stripped = true;
+                    has_more_tool_calls = true;
+                    continue;
+                }
+
+                // The errored message stays in the transcript for honesty.
+                // transform_messages already drops errored turns from what
+                // goes over the wire, so the replayed request is clean.
+                if cupel_core::retry::is_retryable_assistant_error(&message)
+                    && retry_attempt < config.retry.max_retries
+                    && !cancel.is_cancelled()
+                {
+                    retry_attempt += 1;
+                    let delay_ms = config.retry.base_delay_ms * 2_u64.pow(retry_attempt - 1);
+                    tracing::warn!(
+                        attempt = retry_attempt,
+                        max_attempts = config.retry.max_retries,
+                        delay_ms,
+                        "retrying after transient provider failure"
+                    );
+                    sink.emit(AgentEvent::AutoRetry {
+                        attempt: retry_attempt,
+                        max_attempts: config.retry.max_retries,
+                        delay_ms,
+                        error_message: message
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| "Unknown error".to_string()),
+                    });
+
+                    // Abortable backoff, the user can still cancel mid wait.
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return,
+                        () = tokio::time::sleep(
+                            core::time::Duration::from_millis(delay_ms),
+                        ) => {}
+                    }
+                    // Re enter the turn loop, the context still ends with the
+                    // user/tool result message that triggered this request.
+                    // Forcing the flag keeps the `while` condition true even
+                    // when this turn was entered via a steering message.
+                    has_more_tool_calls = true;
+                    continue;
+                }
+                return;
+            }
+            tracing::info!(
+                stop_reason = ?message.stop_reason,
+                input_tokens = message.usage.input,
+                output_tokens = message.usage.output,
+                cache_read_tokens = message.usage.cache_read,
+                cost_usd = message.usage.cost.total,
+                "turn complete"
+            );
+            // A successful response closes the retry/overflow episode.
+            retry_attempt = 0;
+            overflow_compacted = false;
+            thinking_stripped = false;
+
+            let tool_calls: Vec<ToolCall> = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    AssistantContent::ToolCall(tc) => Some(tc.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            let mut tool_results: Vec<ToolResultMessage> = Vec::new();
+            has_more_tool_calls = false;
+            if !tool_calls.is_empty() {
+                let batch = execute_tool_calls(
+                    &context, &message, tool_calls, &config, &hooks, &cancel, sink,
+                )
+                .await;
+                has_more_tool_calls = !batch.terminate;
+                for result in batch.messages {
+                    let message = AgentMessage::Llm(Message::ToolResult(result.clone()));
+                    context.messages.push(message.clone());
+                    new_messages.push(message.clone());
+                    sink.emit(AgentEvent::MessageEnd { message });
+                    tool_results.push(result);
+                }
+            }
+
+            sink.emit(AgentEvent::TurnEnd {
+                message: Box::new(AgentMessage::Llm(Message::Assistant(message.clone()))),
+                tool_results: tool_results.clone(),
+            });
+
+            // A cancelled tool has finished cleaning up its child processes.
+            // Do not start another model request even if it asked for more tools.
+            if cancel.is_cancelled() {
+                return;
+            }
+
+            if hooks.should_stop_after_turn(&message, &tool_results).await {
+                break;
+            }
+
+            pending_messages = hooks.steering_messages().await;
+        }
+
+        // The agent would stop here, follow up messages restart it.
+        let follow_ups = hooks.follow_up_messages().await;
+        if follow_ups.is_empty() {
+            break;
+        }
+        pending_messages = follow_ups;
+    }
+}
+
+/// Run one compaction attempt, emitting start/end events. Returns whether
+/// the transcript actually shrank. Failures are reported on the event
+/// stream but never abort the run. A failed compaction just means the next
+/// request goes out as is (and its error, if any, reaches the user).
+/// Nothing to cut is a silent no op, not a failed attempt.
+async fn run_compaction(
+    context: &mut AgentContext,
+    config: &AgentLoopConfig,
+    hooks: &Arc<dyn AgentHooks>,
+    registry: &Arc<Registry>,
+    cancel: &CancellationToken,
+    sink: &AgentEventSink,
+    reason: CompactionReason,
+) -> bool {
+    if compaction::cut_index(context, config.model.context_window, &config.compaction).is_none() {
+        return false;
+    }
+
+    sink.emit(AgentEvent::CompactionStart { reason });
+    let tokens_before = compaction::estimate_context_tokens(context);
+
+    match compaction::compact_with_hooks(
+        context,
+        registry,
+        &config.model,
+        config.api_key.clone(),
+        &config.compaction,
+        cancel,
+        hooks.as_ref(),
+    )
+    .await
+    {
+        Ok(outcome) => {
+            tracing::info!(
+                ?reason,
+                tokens_before = outcome.tokens_before,
+                tokens_after = outcome.tokens_after,
+                summarized_messages = outcome.summarized_messages,
+                pruned_tool_results = outcome.pruned_tool_results,
+                "context compacted"
+            );
+            sink.emit(AgentEvent::CompactionEnd {
+                tokens_before: outcome.tokens_before,
+                tokens_after: outcome.tokens_after,
+                error: None,
+                summary: outcome.summary,
+                usage: outcome.usage,
+                messages: context.messages.clone(),
+            });
+            true
+        }
+        Err(err) => {
+            tracing::warn!(?reason, error = %err, "compaction failed");
+            sink.emit(AgentEvent::CompactionEnd {
+                tokens_before,
+                tokens_after: compaction::estimate_context_tokens(context),
+                error: Some(err.to_string()),
+                summary: None,
+                usage: err.usage().cloned(),
+                messages: context.messages.clone(),
+            });
+            false
+        }
+    }
+}
+
+/// Remove every thinking block from the assistant turns in `context`,
+/// returns whether there was anything to remove. The caller emits the
+/// updated context so future runs keep the removal, the session log still
+/// retains the original blocks recorded via `MessageEnd`.
+fn strip_thinking_blocks(context: &mut AgentContext) -> bool {
+    context
+        .messages
+        .iter_mut()
+        .filter_map(|message| match message {
+            AgentMessage::Llm(Message::Assistant(assistant)) => Some(assistant),
+            _ => None,
+        })
+        .fold(false, |stripped, assistant| {
+            let before = assistant.content.len();
+            assistant
+                .content
+                .retain(|block| !matches!(block, AssistantContent::Thinking(_)));
+            stripped || assistant.content.len() != before
+        })
+}
+
+/// Stream one assistant response. This is the only place `AgentMessage`s are
+/// converted to provider [`Message`]s.
+///
+/// Failures never propagate as `Err`, they come back as an
+/// [`AssistantMessage`] with `stop_reason` set to `Error` or `Aborted`.
+async fn stream_assistant_response(
+    context: &mut AgentContext,
+    config: &AgentLoopConfig,
+    hooks: &Arc<dyn AgentHooks>,
+    registry: &Registry,
+    cancel: &CancellationToken,
+    sink: &AgentEventSink,
+    request_messages: &[AgentMessage],
+) -> AssistantMessage {
+    if let Some(problem) = hooks.model_request_problem().await {
+        let message = error_assistant_message(config, &InferenceError::Config(problem));
+        emit_final_message(context, sink, message.clone(), false);
+        return message;
+    }
+    // AgentMessage[] → (transform hook) → convert → Message[]
+    let mut transformed = hooks.transform_context(context.messages.clone()).await;
+    if !request_messages.is_empty() {
+        compaction::invalidate_usage_anchors(&mut transformed);
+        // Supplemental state is background for the current assignment. Appending
+        // it after tool results creates a new user turn and can restart old work.
+        // Keep the assignment and every subsequent call/result pair together.
+        let assignment = transformed
+            .iter()
+            .rposition(|message| matches!(message, AgentMessage::Llm(Message::User(_))))
+            .unwrap_or(0);
+        drop(transformed.splice(assignment..assignment, request_messages.iter().cloned()));
+    }
+    let llm_messages = hooks.convert_to_llm(&transformed).await;
+
+    let llm_context = Context {
+        system_prompt: (!context.system_prompt.is_empty()).then(|| context.system_prompt.clone()),
+        messages: llm_messages,
+        tools: (!context.tools.is_empty()).then(|| {
+            context
+                .tools
+                .iter()
+                .map(|tool| Tool {
+                    name: tool.name().to_string(),
+                    description: tool.description().to_string(),
+                    parameters: tool.parameters(),
+                })
+                .collect()
+        }),
+    };
+
+    // Resolve the API key fresh for every call (expiring OAuth tokens).
+    let api_key = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            let message = error_assistant_message(config, &InferenceError::Aborted);
+            emit_final_message(context, sink, message.clone(), false);
+            return message;
+        }
+        key = hooks.api_key(config.model.provider.as_str()) => key.or_else(|| config.api_key.clone()),
+    };
+
+    let options = StreamOptions {
+        temperature: config.temperature,
+        max_tokens: config.max_tokens,
+        api_key,
+        signal: Some(cancel.clone()),
+        session_id: config.session_id.clone(),
+        reasoning: config.thinking_level,
+        ..StreamOptions::default()
+    };
+
+    let stream = match registry.stream(&config.model, llm_context, options) {
+        Ok(stream) => stream,
+        Err(err) => {
+            // No provider registered for this API. Synthesize the error
+            // message the provider would have produced.
+            let message = error_assistant_message(config, &err);
+            emit_final_message(context, sink, message.clone(), false);
+            return message;
+        }
+    };
+
+    let mut stream = stream;
+    let mut started = false;
+    let mut final_message: Option<AssistantMessage> = None;
+    // One wait for the whole reply. pin! fixes the future in place, so each pass of
+    // the loop below polls the same wait through `&mut` instead of starting a new one.
+    let mut steering = core::pin::pin!(hooks.steering_arrived());
+
+    loop {
+        tokio::select! {
+            event = stream.next() => {
+                let Some(event) = event else { break };
+                match event {
+                    AssistantMessageEvent::Start => {
+                        started = true;
+                    }
+                    AssistantMessageEvent::Done { message, .. } => {
+                        final_message = Some(message);
+                        break;
+                    }
+                    AssistantMessageEvent::Error { error, .. } => {
+                        final_message = Some(error);
+                        break;
+                    }
+                    other => {
+                         sink.emit(AgentEvent::MessageUpdate { event: other });
+                    }
+                }
+            }
+            // Cancel only this reply. The provider sees its signal fire and ends the
+            // stream with an aborted message, which the arm above receives like any
+            // other ending. The `if` switches this arm off once the token is
+            // cancelled, a finished future must not be polled again.
+            () = &mut steering, if !cancel.is_cancelled() => cancel.cancel(),
+        }
+    }
+
+    let message = final_message.unwrap_or_else(|| {
+        // Channel closed without a terminal event, a provider bug, but the
+        // loop must still terminate cleanly.
+        error_assistant_message(
+            config,
+            &InferenceError::Stream(MessageStreamError::ClosedBeforeTerminalEvent),
+        )
+    });
+    hooks.observe_usage(Some(&message.usage)).await;
+    emit_final_message(context, sink, message.clone(), started);
+    message
+}
+
+/// An empty assistant message shell used for `MessageStart` announcements.
+fn error_shell(config: &AgentLoopConfig) -> AssistantMessage {
+    AssistantMessage {
+        content: Vec::new(),
+        api: config.model.api.clone(),
+        provider: config.model.provider.clone(),
+        model: config.model.id.clone(),
+        response_model: None,
+        response_id: None,
+        usage: cupel_core::types::Usage::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        error_kind: None,
+        timestamp: now_ms(),
+    }
+}
+
+fn error_assistant_message(config: &AgentLoopConfig, error: &InferenceError) -> AssistantMessage {
+    let kind = error.kind();
+    AssistantMessage {
+        stop_reason: if kind == ErrorKind::Aborted {
+            StopReason::Aborted
+        } else {
+            StopReason::Error
+        },
+        error_message: Some(error.to_string()),
+        error_kind: Some(kind),
+        ..error_shell(config)
+    }
+}
+
+fn emit_final_message(
+    context: &mut AgentContext,
+    sink: &AgentEventSink,
+    message: AssistantMessage,
+    _already_started: bool,
+) {
+    context
+        .messages
+        .push(AgentMessage::Llm(Message::Assistant(message.clone())));
+    sink.emit(AgentEvent::MessageEnd {
+        message: AgentMessage::Llm(Message::Assistant(message)),
+    });
+}
+
+struct ExecutedToolCallBatch {
+    messages: Vec<ToolResultMessage>,
+    terminate: bool,
+}
+
+struct FinalizedToolCall {
+    tool_call: ToolCall,
+    result: AgentToolResult,
+    is_error: bool,
+}
+
+async fn execute_tool_calls(
+    context: &AgentContext,
+    assistant: &AssistantMessage,
+    tool_calls: Vec<ToolCall>,
+    config: &AgentLoopConfig,
+    hooks: &Arc<dyn AgentHooks>,
+    cancel: &CancellationToken,
+    sink: &AgentEventSink,
+) -> ExecutedToolCallBatch {
+    // One sequential only tool in the batch forces sequential execution for
+    // the whole batch (a mutating tool next to a read only one, say).
+    let has_sequential_tool = tool_calls.iter().any(|tc| {
+        context
+            .tools
+            .iter()
+            .find(|t| t.name() == tc.name)
+            .is_some_and(|t| t.execution_mode() == Some(ToolExecutionMode::Sequential))
+    });
+
+    if config.tool_execution == ToolExecutionMode::Sequential || has_sequential_tool {
+        execute_tool_calls_sequential(context, assistant, tool_calls, config, hooks, cancel, sink)
+            .await
+    } else {
+        execute_tool_calls_parallel(context, assistant, tool_calls, config, hooks, cancel, sink)
+            .await
+    }
+}
+
+async fn execute_tool_calls_sequential(
+    context: &AgentContext,
+    assistant: &AssistantMessage,
+    tool_calls: Vec<ToolCall>,
+    config: &AgentLoopConfig,
+    hooks: &Arc<dyn AgentHooks>,
+    cancel: &CancellationToken,
+    sink: &AgentEventSink,
+) -> ExecutedToolCallBatch {
+    let mut finalized_calls: Vec<FinalizedToolCall> = Vec::new();
+    let mut messages: Vec<ToolResultMessage> = Vec::new();
+
+    for tool_call in tool_calls {
+        let finalized = match prepare_tool_call(context, assistant, &tool_call, hooks, cancel).await
+        {
+            Preparation::Immediate { result, is_error } => FinalizedToolCall {
+                tool_call,
+                result,
+                is_error,
+            },
+            Preparation::Ready { tool, args } => {
+                let executed = execute_prepared(
+                    &tool,
+                    &tool_call,
+                    args,
+                    config.tool_gate.as_ref(),
+                    cancel,
+                    sink,
+                )
+                .await;
+                finalize_executed(tool_call, executed)
+            }
+        };
+
+        sink.emit(AgentEvent::ToolExecutionEnd {
+            tool_call_id: finalized.tool_call.id.clone(),
+            tool_name: finalized.tool_call.name.clone(),
+            result: finalized.result.clone(),
+            is_error: finalized.is_error,
+        });
+        let message = tool_result_message(&finalized);
+        messages.push(message);
+        finalized_calls.push(finalized);
+
+        if cancel.is_cancelled() {
+            break;
+        }
+    }
+
+    ExecutedToolCallBatch {
+        terminate: should_terminate(&finalized_calls),
+        messages,
+    }
+}
+
+async fn execute_tool_calls_parallel(
+    context: &AgentContext,
+    assistant: &AssistantMessage,
+    tool_calls: Vec<ToolCall>,
+    config: &AgentLoopConfig,
+    hooks: &Arc<dyn AgentHooks>,
+    cancel: &CancellationToken,
+    sink: &AgentEventSink,
+) -> ExecutedToolCallBatch {
+    // Phase 1, prepare sequentially (start events + before hooks run in
+    // assistant source order, so permission prompts appear predictably).
+    // Preparation results are either finished outcomes or ready to run work.
+    enum Entry {
+        Finalized(FinalizedToolCall),
+        Ready {
+            tool: Arc<dyn AgentTool>,
+            tool_call: ToolCall,
+            args: Value,
+        },
+    }
+    let mut entries: Vec<Entry> = Vec::new();
+
+    for tool_call in tool_calls {
+        match prepare_tool_call(context, assistant, &tool_call, hooks, cancel).await {
+            Preparation::Immediate { result, is_error } => {
+                // Preparation failures resolve immediately. Emit their end
+                // event right now, in order.
+                sink.emit(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: tool_call.id.clone(),
+                    tool_name: tool_call.name.clone(),
+                    result: result.clone(),
+                    is_error,
+                });
+                entries.push(Entry::Finalized(FinalizedToolCall {
+                    tool_call,
+                    result,
+                    is_error,
+                }));
+            }
+            Preparation::Ready { tool, args } => entries.push(Entry::Ready {
+                tool,
+                tool_call,
+                args,
+            }),
+        }
+        if cancel.is_cancelled() {
+            break;
+        }
+    }
+
+    // Phase 2, run the ready entries concurrently. `ToolExecutionEnd` fires
+    // in completion order (that's the point of parallel mode)...
+    let mut ordered: Vec<Option<FinalizedToolCall>> = Vec::new();
+    let mut running = futures_util::stream::FuturesUnordered::new();
+
+    for entry in entries {
+        match entry {
+            Entry::Finalized(finalized) => ordered.push(Some(finalized)),
+            Entry::Ready {
+                tool,
+                tool_call,
+                args,
+            } => {
+                let slot = ordered.len();
+                ordered.push(None);
+                let cancel = cancel.clone();
+                let sink = sink.clone();
+                let gate = config.tool_gate.clone();
+                running.push(async move {
+                    let executed =
+                        execute_prepared(&tool, &tool_call, args, gate.as_ref(), &cancel, &sink)
+                            .await;
+                    let finalized = finalize_executed(tool_call, executed);
+                    sink.emit(AgentEvent::ToolExecutionEnd {
+                        tool_call_id: finalized.tool_call.id.clone(),
+                        tool_name: finalized.tool_call.name.clone(),
+                        result: finalized.result.clone(),
+                        is_error: finalized.is_error,
+                    });
+                    (slot, finalized)
+                });
+            }
+        }
+    }
+    while let Some((slot, finalized)) = running.next().await {
+        ordered[slot] = Some(finalized);
+    }
+
+    // ...but tool result messages are emitted in assistant source order, so
+    // the transcript stays aligned with the tool_use blocks.
+    let finalized_calls: Vec<FinalizedToolCall> = ordered.into_iter().flatten().collect();
+    let mut messages: Vec<ToolResultMessage> = Vec::new();
+    for finalized in &finalized_calls {
+        let message = tool_result_message(finalized);
+        messages.push(message);
+    }
+
+    ExecutedToolCallBatch {
+        terminate: should_terminate(&finalized_calls),
+        messages,
+    }
+}
+
+/// Outcome of the preflight phase for one tool call.
+enum Preparation {
+    Immediate {
+        result: AgentToolResult,
+        is_error: bool,
+    },
+    Ready {
+        tool: Arc<dyn AgentTool>,
+        args: Value,
+    },
+}
+
+async fn prepare_tool_call(
+    context: &AgentContext,
+    assistant: &AssistantMessage,
+    tool_call: &ToolCall,
+    hooks: &Arc<dyn AgentHooks>,
+    cancel: &CancellationToken,
+) -> Preparation {
+    let error = |text: String| Preparation::Immediate {
+        result: AgentToolResult::text(text),
+        is_error: true,
+    };
+
+    let Some(tool) = context
+        .tools
+        .iter()
+        .find(|t| t.name() == tool_call.name)
+        .cloned()
+    else {
+        return error(format!("Tool {} not found", tool_call.name));
+    };
+
+    // Arguments must at least be a JSON object, field level validation is
+    // the tool's own serde deserialization.
+    if !tool_call.arguments.is_object() {
+        return error(format!(
+            "Tool {} arguments must be a JSON object",
+            tool_call.name
+        ));
+    }
+
+    if let Some(before) = hooks.before_tool_call(assistant, tool_call).await {
+        if cancel.is_cancelled() {
+            return error("Operation aborted".to_string());
+        }
+        if before.block {
+            return error(
+                before
+                    .reason
+                    .unwrap_or_else(|| "Tool execution was blocked".to_string()),
+            );
+        }
+    }
+    if cancel.is_cancelled() {
+        return error("Operation aborted".to_string());
+    }
+
+    Preparation::Ready {
+        tool,
+        args: tool_call.arguments.clone(),
+    }
+}
+
+async fn execute_prepared(
+    tool: &Arc<dyn AgentTool>,
+    tool_call: &ToolCall,
+    args: Value,
+    gate: Option<&Arc<dyn crate::ToolExecutionGate>>,
+    cancel: &CancellationToken,
+    sink: &AgentEventSink,
+) -> (AgentToolResult, bool) {
+    sink.emit(AgentEvent::ToolExecutionStart {
+        tool_call_id: tool_call.id.clone(),
+        tool_name: tool_call.name.clone(),
+    });
+    let on_update: ToolUpdateFn = {
+        let sink = sink.clone();
+        let tool_call_id = tool_call.id.clone();
+        let tool_name = tool_call.name.clone();
+        Arc::new(move |partial| {
+            sink.emit(AgentEvent::ToolExecutionUpdate {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                partial,
+            });
+        })
+    };
+
+    let _lease = match gate {
+        Some(gate) => match gate.enter(&tool_call.name, cancel).await {
+            Ok(lease) => lease,
+            Err(error) => return (AgentToolResult::text(error.to_string()), true),
+        },
+        None => None,
+    };
+    if cancel.is_cancelled() {
+        return (AgentToolResult::text("Operation aborted"), true);
+    }
+
+    let started = std::time::Instant::now();
+    tracing::debug!(tool = %tool_call.name, tool_call_id = %tool_call.id, "tool execution start");
+    let (result, is_error) = match tool
+        .execute(&tool_call.id, args, cancel.clone(), Some(on_update))
+        .await
+    {
+        Ok(result) => (result, false),
+        Err(err) => (AgentToolResult::text(err.to_string()), true),
+    };
+    tracing::info!(
+        tool = %tool_call.name,
+        duration_ms = started.elapsed().as_millis() as u64,
+        is_error,
+        "tool executed"
+    );
+    (result, is_error)
+}
+
+fn finalize_executed(
+    tool_call: ToolCall,
+    (result, is_error): (AgentToolResult, bool),
+) -> FinalizedToolCall {
+    FinalizedToolCall {
+        tool_call,
+        result,
+        is_error,
+    }
+}
+
+/// Early termination requires every tool in the batch to ask for it.
+fn should_terminate(finalized: &[FinalizedToolCall]) -> bool {
+    !finalized.is_empty() && finalized.iter().all(|f| f.result.terminate)
+}
+
+fn tool_result_message(finalized: &FinalizedToolCall) -> ToolResultMessage {
+    ToolResultMessage {
+        tool_call_id: finalized.tool_call.id.clone(),
+        tool_name: finalized.tool_call.name.clone(),
+        content: finalized.result.content.clone(),
+        details: finalized.result.details.clone(),
+        is_error: finalized.is_error,
+        timestamp: now_ms(),
+    }
+}

@@ -1,0 +1,832 @@
+//! End to end tests of context compaction, using a mock provider that
+//! serves both request kinds the loop makes, summarization calls
+//! (recognized by the summarization system prompt) and normal turn calls.
+
+// Integration test files are compiled as their own crate in test mode, the
+// "tests outside #[cfg(test)]" restriction lint does not apply.
+#![allow(clippy::tests_outside_test_module)]
+
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+
+use futures_util::StreamExt as _;
+use tokio_util::sync::CancellationToken;
+
+use cupel_agent::{
+    Agent, AgentEvent, AgentHooks, AgentLoopConfig, AgentMessage, AgentOptions, CompactionConfig,
+    CompactionReason, NoHooks, RetryConfig, ToolExecutionMode,
+    agent_loop::{agent_event_channel, agent_loop},
+    compaction::{
+        COMPACTION_MARKER, ELIDED_TOOL_RESULT, SUMMARIZATION_SYSTEM_PROMPT, compact,
+        estimate_context_tokens, should_compact,
+    },
+    types::AgentContext,
+};
+use cupel_core::{
+    event_stream::{AssistantMessageStream, assistant_message_channel},
+    options_util,
+    provider::{Provider, Registry},
+    types::{
+        Api, AssistantContent, AssistantMessage, Context, Message, Model, ModelCost, StopReason,
+        StreamOptions, TextContent, Usage, UserContentBody, now_ms,
+    },
+};
+
+/// Serves summarization requests with a fixed summary, records every turn
+/// request's message list. Optionally fails the first N turn requests.
+struct CompactionAwareProvider {
+    turn_calls: AtomicU32,
+    summarization_calls: AtomicU32,
+    summarization_max_tokens: Mutex<Vec<Option<u64>>>,
+    fail_first_turns: u32,
+    turn_error: &'static str,
+    fail_summarization: bool,
+    seen_turn_requests: Mutex<Vec<(String, usize)>>,
+    seen_turn_messages: Mutex<Vec<Vec<Message>>>,
+}
+
+impl CompactionAwareProvider {
+    fn new(fail_first_turns: u32, turn_error: &'static str) -> Self {
+        Self {
+            turn_calls: AtomicU32::new(0),
+            summarization_calls: AtomicU32::new(0),
+            summarization_max_tokens: Mutex::new(Vec::new()),
+            fail_first_turns,
+            turn_error,
+            fail_summarization: false,
+            seen_turn_requests: Mutex::new(Vec::new()),
+            seen_turn_messages: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+fn assistant(model: &Model, content: Vec<AssistantContent>) -> AssistantMessage {
+    AssistantMessage {
+        content,
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        response_model: None,
+        response_id: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        error_kind: None,
+        timestamp: now_ms(),
+    }
+}
+
+impl Provider for CompactionAwareProvider {
+    fn api(&self) -> &str {
+        "mock"
+    }
+
+    fn stream(
+        &self,
+        model: &Model,
+        context: Context,
+        options: StreamOptions,
+    ) -> AssistantMessageStream {
+        let (stream, sink) = assistant_message_channel();
+        let _ = sink.start();
+
+        // Summarization requests are recognizable by their system prompt.
+        if context.system_prompt.as_deref() == Some(SUMMARIZATION_SYSTEM_PROMPT) {
+            self.summarization_calls.fetch_add(1, Ordering::SeqCst);
+            self.summarization_max_tokens
+                .lock()
+                .expect("test mutex")
+                .push(options.max_tokens);
+            if self.fail_summarization {
+                let message = AssistantMessage {
+                    stop_reason: StopReason::Error,
+                    error_message: Some("summarization unavailable".into()),
+                    ..assistant(model, Vec::new())
+                };
+                let _ = sink.error(StopReason::Error, message);
+                return stream;
+            }
+            let message = assistant(
+                model,
+                vec![AssistantContent::Text(TextContent::plain(
+                    "## Goal\nSummarized history.",
+                ))],
+            );
+            let _ = sink.done(StopReason::Stop, message);
+            return stream;
+        }
+
+        // A turn request, record what the loop actually sent.
+        let first_text = context
+            .messages
+            .first()
+            .and_then(|m| match m {
+                Message::User(user) => match &user.content {
+                    UserContentBody::Text(text) => Some(text.clone()),
+                    UserContentBody::Blocks(_) => None,
+                },
+                _ => None,
+            })
+            .unwrap_or_default();
+        self.seen_turn_requests
+            .lock()
+            .expect("test mutex")
+            .push((first_text, context.messages.len()));
+        self.seen_turn_messages
+            .lock()
+            .expect("test mutex")
+            .push(context.messages.clone());
+
+        let call = self.turn_calls.fetch_add(1, Ordering::SeqCst);
+        if call < self.fail_first_turns {
+            let message = AssistantMessage {
+                stop_reason: StopReason::Error,
+                error_message: Some(self.turn_error.to_string()),
+                ..assistant(model, Vec::new())
+            };
+            let _ = sink.error(StopReason::Error, message);
+        } else {
+            let mut message = assistant(
+                model,
+                vec![AssistantContent::Text(TextContent::plain("done"))],
+            );
+            // Anchor later prompts to the request that actually went out.
+            message.usage = Usage {
+                input: options_util::estimate_context_tokens(&context),
+                output: 1,
+                total_tokens: options_util::estimate_context_tokens(&context) + 1,
+                ..Usage::default()
+            };
+            let _ = sink.done(StopReason::Stop, message);
+        }
+        stream
+    }
+}
+
+fn mock_model(context_window: u64) -> Model {
+    Model {
+        id: "mock-model".into(),
+        name: "Mock".into(),
+        api: Api::from("mock"),
+        provider: cupel_core::types::Provider::from("mock"),
+        base_url: String::new(),
+        reasoning: false,
+        thinking_level_map: None,
+        input: vec![cupel_core::types::InputModality::Text],
+        cost: ModelCost::default(),
+        context_window,
+        max_context_window: None,
+        max_tokens: 4096,
+        headers: None,
+        compat: None,
+    }
+}
+
+async fn run_with(
+    provider: Arc<CompactionAwareProvider>,
+    context_window: u64,
+    compaction: CompactionConfig,
+    old_messages: Vec<AgentMessage>,
+) -> Vec<AgentEvent> {
+    let mut registry = Registry::new();
+    registry.register(provider);
+
+    let config = AgentLoopConfig {
+        model: mock_model(context_window),
+        thinking_level: None,
+        api_key: Some("test".into()),
+        session_id: None,
+        temperature: None,
+        max_tokens: None,
+        tool_execution: ToolExecutionMode::Parallel,
+        tool_gate: None,
+        retry: RetryConfig {
+            max_retries: 0, // isolate compaction from transient retry
+            base_delay_ms: 1,
+        },
+        compaction,
+    };
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: old_messages,
+        tools: Vec::new(),
+    };
+
+    let (mut events, sink) = agent_event_channel();
+    let loop_task = tokio::spawn(agent_loop(
+        vec![AgentMessage::user_text("current question")],
+        context,
+        config,
+        Arc::new(NoHooks),
+        Arc::new(registry),
+        CancellationToken::new(),
+        sink,
+    ));
+    let mut collected = Vec::new();
+    while let Some(event) = events.next().await {
+        collected.push(event);
+    }
+    loop_task.await.expect("loop task completes");
+    collected
+}
+
+fn stateful_agent(
+    provider: Arc<CompactionAwareProvider>,
+    context_window: u64,
+    messages: Vec<AgentMessage>,
+) -> Agent {
+    let mut registry = Registry::new();
+    registry.register(provider);
+    let mut options = AgentOptions::new(mock_model(context_window), Arc::new(registry));
+    options.messages = messages;
+    options.compaction = CompactionConfig {
+        enabled: true,
+        reserve_tokens: 1000,
+        keep_recent_tokens: 500,
+    };
+    options.retry.max_retries = 0;
+    Agent::new(options)
+}
+
+async fn prompt_agent(agent: &mut Agent, text: &str) -> Vec<AgentEvent> {
+    let mut events = agent.prompt_text(text).expect("agent is idle");
+    let mut collected = Vec::new();
+    while let Some(event) = events.next().await {
+        collected.push(event);
+    }
+    agent.wait_for_idle().await;
+    collected
+}
+
+/// Reconstruct the effective context from the replacement and later appends.
+fn context_after_compaction(events: &[AgentEvent]) -> Vec<AgentMessage> {
+    let mut messages = Vec::new();
+    for event in events {
+        match event {
+            AgentEvent::CompactionEnd {
+                messages: replacement,
+                ..
+            } => messages.clone_from(replacement),
+            AgentEvent::MessageEnd { message } => messages.push(message.clone()),
+            _ => {}
+        }
+    }
+    messages
+}
+
+fn compaction_events(events: &[AgentEvent]) -> Vec<(CompactionReason, bool)> {
+    let mut out = Vec::new();
+    let mut pending: Option<CompactionReason> = None;
+    for event in events {
+        match event {
+            AgentEvent::CompactionStart { reason } => pending = Some(*reason),
+            AgentEvent::CompactionEnd { error, .. } => {
+                if let Some(reason) = pending.take() {
+                    out.push((reason, error.is_none()));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// ~1000 estimated tokens of filler per message (4000 chars / 4).
+fn big_history(count: usize) -> Vec<AgentMessage> {
+    (0..count)
+        .map(|i| AgentMessage::user_text(format!("message {i}: {}", "x".repeat(4000))))
+        .collect()
+}
+
+#[tokio::test]
+async fn threshold_compaction_shrinks_the_request() {
+    let provider = Arc::new(CompactionAwareProvider::new(0, ""));
+    // Window 3000, reserve capped at 750 → threshold 2250 estimated tokens.
+    // Five ~1000 token messages of history is well past that.
+    let config = CompactionConfig {
+        enabled: true,
+        reserve_tokens: 1000,
+        keep_recent_tokens: 500,
+    };
+    let events = run_with(Arc::clone(&provider), 3000, config, big_history(5)).await;
+
+    assert_eq!(
+        compaction_events(&events),
+        vec![(CompactionReason::Threshold, true)]
+    );
+    // Exactly one turn request, and it was the compacted one, it starts with
+    // the summary marker and carries far fewer messages than 5 + prompt.
+    let seen = provider.seen_turn_requests.lock().expect("test mutex");
+    assert_eq!(seen.len(), 1);
+    let (first_text, message_count) = &seen[0];
+    assert!(
+        first_text.starts_with(COMPACTION_MARKER),
+        "request should start with the summary, got: {first_text:.60}"
+    );
+    assert!(
+        *message_count <= 3,
+        "5 history messages should have collapsed, got {message_count}"
+    );
+    assert!(matches!(events.last(), Some(AgentEvent::AgentEnd { .. })));
+    // User text history has nothing to prune, so this path did pay one
+    // summarization call. This is the counterpart of the pruning test below.
+    assert_eq!(provider.summarization_calls.load(Ordering::SeqCst), 1);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::CompactionEnd { summary: Some(summary), .. } if !summary.is_empty()
+    )));
+}
+
+#[tokio::test]
+async fn default_compaction_fits_a_small_context_window() {
+    let provider = Arc::new(CompactionAwareProvider::new(0, ""));
+    let events = run_with(
+        Arc::clone(&provider),
+        4096,
+        CompactionConfig::default(),
+        big_history(4),
+    )
+    .await;
+
+    assert_eq!(
+        compaction_events(&events),
+        vec![(CompactionReason::Threshold, true)]
+    );
+    assert_eq!(provider.summarization_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *provider
+            .summarization_max_tokens
+            .lock()
+            .expect("test mutex"),
+        vec![Some(819)],
+        "summary output is limited to 80% of the 1024-token reserve"
+    );
+    let seen = provider.seen_turn_requests.lock().expect("test mutex");
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].0.starts_with(COMPACTION_MARKER));
+    assert_eq!(
+        seen[0].1, 4,
+        "summary + two recent messages + current question"
+    );
+}
+
+#[tokio::test]
+async fn threshold_without_a_cut_point_emits_no_compaction_events() {
+    let provider = Arc::new(CompactionAwareProvider::new(0, ""));
+    // Exact usage can exceed the threshold even when all message bodies
+    // fit inside the keep window (e.g. a large system prompt/tool schemas).
+    let mut previous = assistant(
+        &mock_model(4096),
+        vec![AssistantContent::Text(TextContent::plain(
+            "previous answer",
+        ))],
+    );
+    previous.usage.input = 3900;
+    let events = run_with(
+        Arc::clone(&provider),
+        4096,
+        CompactionConfig::default(),
+        vec![
+            AgentMessage::user_text("previous question"),
+            AgentMessage::Llm(Message::Assistant(previous)),
+        ],
+    )
+    .await;
+
+    assert!(events.iter().all(|e| !matches!(
+        e,
+        AgentEvent::CompactionStart { .. } | AgentEvent::CompactionEnd { .. }
+    )));
+    assert_eq!(provider.summarization_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.turn_calls.load(Ordering::SeqCst), 1);
+    let seen = provider.seen_turn_requests.lock().expect("test mutex");
+    assert_eq!(seen[0].1, 3, "history stays intact");
+}
+
+#[tokio::test]
+async fn overflow_without_a_cut_point_emits_no_compaction_events() {
+    let provider = Arc::new(CompactionAwareProvider::new(
+        1,
+        "prompt is too long: 5000 tokens > 4096 maximum",
+    ));
+    let events = run_with(
+        Arc::clone(&provider),
+        4096,
+        CompactionConfig::default(),
+        Vec::new(),
+    )
+    .await;
+
+    assert!(events.iter().all(|e| !matches!(
+        e,
+        AgentEvent::CompactionStart { .. } | AgentEvent::CompactionEnd { .. }
+    )));
+    assert_eq!(provider.summarization_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.turn_calls.load(Ordering::SeqCst), 1);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::MessageEnd { message: AgentMessage::Llm(Message::Assistant(a)) }
+            if a.error_message.as_deref() == Some(provider.turn_error)
+    )));
+}
+
+/// ~1000 estimated tokens of tool result filler per message, prefixed by a
+/// user message so the cut point has a boundary to land on.
+fn tool_heavy_history(count: usize) -> Vec<AgentMessage> {
+    let mut messages = vec![AgentMessage::user_text("please read the files")];
+    for i in 0..count {
+        messages.push(AgentMessage::Llm(Message::ToolResult(
+            cupel_core::types::ToolResultMessage {
+                tool_call_id: format!("call_{i}"),
+                tool_name: "read".into(),
+                content: vec![cupel_core::types::ToolResultContent::Text(
+                    TextContent::plain("y".repeat(4000)),
+                )],
+                details: None,
+                is_error: false,
+                timestamp: now_ms(),
+            },
+        )));
+    }
+    messages
+}
+
+#[tokio::test]
+async fn tool_heavy_history_compacts_without_a_summarization_call() {
+    let provider = Arc::new(CompactionAwareProvider::new(0, ""));
+    // Same threshold as above (window 3000, reserve capped at 750), but the
+    // bulk is tool output, so the free pruning tier alone must reclaim it.
+    let config = CompactionConfig {
+        enabled: true,
+        reserve_tokens: 1000,
+        keep_recent_tokens: 500,
+    };
+    let events = run_with(Arc::clone(&provider), 3000, config, tool_heavy_history(5)).await;
+
+    // Compaction ran and succeeded...
+    assert_eq!(
+        compaction_events(&events),
+        vec![(CompactionReason::Threshold, true)]
+    );
+    // ...with zero LLM cost, no summarization request ever hit the provider.
+    assert_eq!(provider.summarization_calls.load(Ordering::SeqCst), 0);
+
+    // The turn request kept the full message count. Only bodies were elided,
+    // and no summary message was spliced in.
+    let seen = provider.seen_turn_requests.lock().expect("test mutex");
+    assert_eq!(seen.len(), 1);
+    let (first_text, message_count) = &seen[0];
+    assert!(
+        !first_text.starts_with(COMPACTION_MARKER),
+        "no summary should exist on the pruning-only path"
+    );
+    assert_eq!(*message_count, 7, "1 user + 5 results + new prompt");
+    assert!(matches!(events.last(), Some(AgentEvent::AgentEnd { .. })));
+}
+
+#[tokio::test]
+async fn pruning_invalidates_usage_anchors_in_the_kept_tail() {
+    let model = mock_model(16_000);
+    let usage = Usage {
+        input: 12_000,
+        output: 1000,
+        cache_read: 1000,
+        cache_write: 1000,
+        total_tokens: 15_000,
+        ..Usage::default()
+    };
+    let mut old = assistant(&model, Vec::new());
+    old.usage = Usage {
+        total_tokens: 0,
+        ..usage.clone()
+    };
+    let mut recent = assistant(
+        &model,
+        vec![AssistantContent::Text(TextContent::plain("recent answer"))],
+    );
+    recent.usage = usage;
+    let mut messages = tool_heavy_history(13);
+    messages.insert(1, AgentMessage::Llm(Message::Assistant(old)));
+    messages.push(AgentMessage::user_text("recent question"));
+    messages.push(AgentMessage::Llm(Message::Assistant(recent)));
+    let mut context = AgentContext {
+        system_prompt: "s".repeat(4000),
+        messages,
+        tools: Vec::new(),
+    };
+    let config = CompactionConfig::default();
+    assert_eq!(estimate_context_tokens(&context), 15_000);
+    assert!(should_compact(15_000, model.context_window, &config));
+
+    // An empty registry makes any unnecessary summarization call fail.
+    let outcome = compact(
+        &mut context,
+        &Arc::new(Registry::new()),
+        &model,
+        None,
+        &config,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("pruning alone suffices despite the retained usage anchor");
+
+    assert_eq!(outcome.pruned_tool_results, 13);
+    assert_eq!(outcome.summarized_messages, 0);
+    assert!(outcome.summary.is_none());
+    assert_eq!(outcome.tokens_before, 15_000);
+    assert!(outcome.tokens_after < outcome.tokens_before);
+    assert!(!should_compact(
+        outcome.tokens_after,
+        model.context_window,
+        &config
+    ));
+    assert_eq!(context.messages.len(), 17, "pruning preserves all messages");
+    for message in &context.messages {
+        if let AgentMessage::Llm(Message::Assistant(a)) = message {
+            assert_eq!(a.usage, Usage::default(), "no older anchor may take over");
+        }
+    }
+
+    // The first provider request after pruning must use the new estimate
+    // too, leaving the full output budget rather than clamping it to 1.
+    let request = Context {
+        system_prompt: Some(context.system_prompt.clone()),
+        messages: NoHooks.convert_to_llm(&context.messages).await,
+        tools: None,
+    };
+    assert_eq!(
+        options_util::estimate_context_tokens(&request),
+        outcome.tokens_after
+    );
+    assert_eq!(
+        options_util::clamp_max_tokens_to_context(&model, &request, model.max_tokens),
+        model.max_tokens
+    );
+}
+
+#[tokio::test]
+async fn summarization_invalidates_usage_anchor_in_the_kept_tail() {
+    let model = mock_model(16_000);
+    let provider = Arc::new(CompactionAwareProvider::new(0, ""));
+    let mut registry = Registry::new();
+    registry.register(Arc::<CompactionAwareProvider>::clone(&provider));
+    let mut recent = assistant(
+        &model,
+        vec![AssistantContent::Text(TextContent::plain("recent answer"))],
+    );
+    recent.usage = Usage {
+        input: 14_000,
+        output: 1000,
+        total_tokens: 15_000,
+        ..Usage::default()
+    };
+    let mut messages = big_history(16);
+    messages.push(AgentMessage::user_text("recent question"));
+    messages.push(AgentMessage::Llm(Message::Assistant(recent)));
+    let mut context = AgentContext {
+        system_prompt: String::new(),
+        messages,
+        tools: Vec::new(),
+    };
+    let config = CompactionConfig::default();
+    let outcome = compact(
+        &mut context,
+        &Arc::new(registry),
+        &model,
+        None,
+        &config,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("summarization succeeds");
+
+    assert_eq!(provider.summarization_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome.pruned_tool_results, 0);
+    assert!(outcome.summarized_messages > 0);
+    assert!(outcome.summary.is_some());
+    assert_eq!(outcome.tokens_before, 15_000);
+    assert!(outcome.tokens_after < outcome.tokens_before);
+    assert!(!should_compact(
+        outcome.tokens_after,
+        model.context_window,
+        &config
+    ));
+    let Some(AgentMessage::Llm(Message::Assistant(retained))) = context.messages.last() else {
+        panic!("recent assistant message must be retained");
+    };
+    assert_eq!(retained.usage, Usage::default());
+    assert_eq!(
+        retained.content,
+        vec![AssistantContent::Text(TextContent::plain("recent answer"))]
+    );
+}
+
+#[tokio::test]
+async fn overflow_error_triggers_reactive_compaction_and_recovery() {
+    // The provider rejects the first turn request the way Anthropic does.
+    let provider = Arc::new(CompactionAwareProvider::new(
+        1,
+        "prompt is too long: 250000 tokens > 200000 maximum",
+    ));
+    // Threshold generous enough that proactive compaction does not fire
+    // (window 100k), so only the reactive path runs.
+    let config = CompactionConfig {
+        enabled: true,
+        reserve_tokens: 1000,
+        keep_recent_tokens: 500,
+    };
+    let events = run_with(Arc::clone(&provider), 100_000, config, big_history(4)).await;
+
+    assert_eq!(
+        compaction_events(&events),
+        vec![(CompactionReason::Overflow, true)]
+    );
+    // Turn 1 failed with overflow, turn 2 (compacted) succeeded.
+    assert_eq!(provider.turn_calls.load(Ordering::SeqCst), 2);
+    let seen = provider.seen_turn_requests.lock().expect("test mutex");
+    assert!(seen[1].0.starts_with(COMPACTION_MARKER));
+    // The run recovered, last assistant message is a success.
+    let recovered = events.iter().rev().find_map(|e| match e {
+        AgentEvent::MessageEnd {
+            message: AgentMessage::Llm(Message::Assistant(a)),
+        } => Some(a.stop_reason),
+        _ => None,
+    });
+    assert_eq!(recovered, Some(StopReason::Stop));
+}
+
+async fn assert_compaction_persists(reason: CompactionReason) {
+    let fail_first_turns = u32::from(reason == CompactionReason::Overflow);
+    let window = if fail_first_turns == 0 { 3000 } else { 100_000 };
+    let provider = Arc::new(CompactionAwareProvider::new(
+        fail_first_turns,
+        "prompt is too long: 250000 tokens > 200000 maximum",
+    ));
+    let mut agent = stateful_agent(Arc::clone(&provider), window, big_history(5));
+    let first = prompt_agent(&mut agent, "current question").await;
+    assert_eq!(
+        compaction_events(&first),
+        vec![(reason, true)],
+        "first prompt must compact for the expected reason"
+    );
+
+    let retained = agent.state().messages;
+    assert_eq!(
+        retained,
+        context_after_compaction(&first),
+        "state must apply the replacement before later message appends"
+    );
+    assert!(
+        retained.len() < 7 + fail_first_turns as usize,
+        "old history must be replaced, not appended"
+    );
+    assert!(
+        matches!(
+            &retained[0],
+            AgentMessage::Llm(Message::User(user))
+                if matches!(&user.content, UserContentBody::Text(text) if text.starts_with(COMPACTION_MARKER))
+        ),
+        "retained history must start with the summary"
+    );
+    // A summary is a context replacement, not a newly produced message to
+    // record. The original prompt and even overflow errors remain events.
+    assert_eq!(
+        first
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::MessageEnd { .. }))
+            .count(),
+        2 + fail_first_turns as usize,
+        "recording events must contain only the prompt and original responses"
+    );
+
+    let second = prompt_agent(&mut agent, "next question").await;
+    assert!(
+        compaction_events(&second).is_empty(),
+        "next prompt must not compact the same history again"
+    );
+    assert_eq!(
+        provider.summarization_calls.load(Ordering::SeqCst),
+        1,
+        "only one summarization call across both prompts"
+    );
+    assert_eq!(
+        provider.turn_calls.load(Ordering::SeqCst),
+        2 + fail_first_turns,
+        "only the first prompt may need an overflow retry"
+    );
+    let expected = NoHooks.convert_to_llm(&retained).await;
+    let seen = provider.seen_turn_messages.lock().expect("test mutex");
+    let request = seen.last().expect("second prompt request");
+    assert_eq!(
+        &request[..expected.len()],
+        expected.as_slice(),
+        "next request must replay the compacted state"
+    );
+    assert_eq!(
+        request.len(),
+        expected.len() + 1,
+        "only the new prompt is added"
+    );
+}
+
+/// A resumed transcript keeps every message, but its newest reply reports the
+/// usage of the compacted request the original run sent. That number must not
+/// hide the reloaded history, the first prompt estimates from content and
+/// compacts, and the reply it gets makes usage trustworthy again.
+#[tokio::test]
+async fn seeded_history_does_not_trust_usage_it_did_not_observe() {
+    let provider = Arc::new(CompactionAwareProvider::new(0, ""));
+    let model = mock_model(3000);
+    let mut history = big_history(5);
+    let mut reply = assistant(
+        &model,
+        vec![AssistantContent::Text(TextContent::plain("done"))],
+    );
+    // Window 3000, threshold 2250, five ~1000 token messages exceed it, but
+    // this anchor from a compacted request says the context held 200 tokens.
+    reply.usage.input = 200;
+    history.push(AgentMessage::Llm(Message::Assistant(reply)));
+    let mut agent = stateful_agent(Arc::clone(&provider), 3000, history);
+
+    let first = prompt_agent(&mut agent, "next question").await;
+    assert_eq!(
+        compaction_events(&first),
+        vec![(CompactionReason::Threshold, true)],
+        "the reloaded history must be estimated from its content"
+    );
+
+    // The reply to the compacted request reports the real size again.
+    let second = prompt_agent(&mut agent, "and then?").await;
+    assert!(compaction_events(&second).is_empty());
+    assert_eq!(provider.summarization_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn threshold_compaction_persists_in_state_and_the_next_prompt() {
+    assert_compaction_persists(CompactionReason::Threshold).await;
+}
+
+#[tokio::test]
+async fn overflow_compaction_persists_in_state_and_the_next_prompt() {
+    assert_compaction_persists(CompactionReason::Overflow).await;
+}
+
+#[tokio::test]
+async fn pruning_persists_even_when_summarization_fails() {
+    for fail_summarization in [false, true] {
+        let mut provider = CompactionAwareProvider::new(0, "");
+        provider.fail_summarization = fail_summarization;
+        let provider = Arc::new(provider);
+        let mut history = tool_heavy_history(5);
+        if fail_summarization {
+            // Pruning alone cannot remove this user text bulk, so the
+            // summarization tier runs and fails after the tool bodies changed.
+            history.insert(0, AgentMessage::user_text("x".repeat(20_000)));
+        }
+        let mut agent = stateful_agent(Arc::clone(&provider), 3000, history);
+        let first = prompt_agent(&mut agent, "current question").await;
+        assert_eq!(
+            compaction_events(&first),
+            vec![(CompactionReason::Threshold, !fail_summarization)]
+        );
+        let retained = agent.state().messages;
+        assert_eq!(retained, context_after_compaction(&first));
+        let results: Vec<_> = retained
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::Llm(Message::ToolResult(result)) => Some(result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 5);
+        for result in results {
+            assert_eq!(
+                result.content,
+                vec![cupel_core::types::ToolResultContent::Text(
+                    TextContent::plain(ELIDED_TOOL_RESULT)
+                )]
+            );
+        }
+        assert_eq!(
+            provider.summarization_calls.load(Ordering::SeqCst),
+            u32::from(fail_summarization)
+        );
+
+        prompt_agent(&mut agent, "next question").await;
+        let expected = NoHooks.convert_to_llm(&retained).await;
+        let seen = provider.seen_turn_messages.lock().expect("test mutex");
+        let request = seen.last().expect("second prompt request");
+        assert_eq!(&request[..expected.len()], expected.as_slice());
+    }
+}
+
+#[tokio::test]
+async fn compaction_disabled_never_compacts() {
+    let provider = Arc::new(CompactionAwareProvider::new(0, ""));
+    let config = CompactionConfig {
+        enabled: false,
+        ..CompactionConfig::default()
+    };
+    let events = run_with(Arc::clone(&provider), 3000, config, big_history(5)).await;
+    assert!(compaction_events(&events).is_empty());
+}

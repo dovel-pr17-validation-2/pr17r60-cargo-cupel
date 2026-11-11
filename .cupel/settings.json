@@ -1,0 +1,17 @@
+{
+  "loopKiller": {
+    "maxRepeats": 3
+  },
+  "model": {
+    "default": {
+      "provider": "openai-codex",
+      "model": "codex/gpt-6.1-sol",
+      "thinkingLevel": "high"
+    },
+    "implement": {
+      "provider": "openai-codex",
+      "model": "codex/gpt-6.1-terra",
+      "thinkingLevel": "medium"
+    }
+  }
+}

@@ -1,0 +1,636 @@
+# Changelog
+
+Releases up to v0.1.15-beta used patch bumps for feature releases;
+from v0.2.0-beta, minor = features, patch = fixes.
+
+## [v0.35.2] - 2026-11-07
+
+- fix(tui): allow transcript drag selection alongside mouse-wheel scrolling, with Ctrl+O copying selected ranges without mode toggling
+- fix(tui): harden fenced code blocks in chat Markdown
+- fix(undo): let valid patches continue after formatter or external edits, disable unsafe undo history with one warning, and prevent case aliases from bypassing conflict detection
+- fix(session): remove undo snapshots when sessions end, on `/new`, and on normal shutdown while preserving transcripts and helper files; undo history expires when a session closes
+- chore(install): remove Homebrew installation support and retain the installer and `/update` workflows
+- test(undo): cover cleanup, session isolation, crash recovery, path aliases, and non-blocking journal conflicts
+
+## [v0.35.1] - 2026-11-06
+
+- fix(tui): add Ctrl/Alt+Left/Right word jumps, vertical movement through wrapped prompt lines, and mouse cursor positioning
+- fix(tui): move prompt history recall to Shift+Up/Down, preserving drafts and autocomplete/question navigation
+- style(tui): give chat user prompts a distinct theme-aware background while preserving Markdown and selection highlighting
+- test(tui): cover prompt navigation, display-width mapping, scrolling, resizing, and mouse selection mode
+
+## [v0.35.0] - 2026-11-06
+
+- feat(prompt): acknowledge mistakes directly and explain only non-obvious decisions and risks, skipping routine status updates
+- style(tui): add one column of left and right padding to chat user prompts, preserving wrapping and Markdown
+- style(tui): match chat user prompts to the prompt pane's theme background and foreground, preserving Markdown and selection highlighting
+- feat(undo): add `/changes` and snapshot-based per-turn `/undo` in TUI and plain mode, preserving dirty work and refusing newer file changes
+- feat(session): persist private undo snapshots across resume and hot reload, including creations, deletions, renames, and overwritten destinations
+- test(undo): cover turn boundaries, lagging frontends, conflicts, permissions, partial patches, interrupted restoration, and session isolation
+
+## [v0.34.13] - 2026-11-06
+
+- feat(tui): support clicking and dragging the transcript scrollbar with mouse capture enabled
+- fix(tui): let the transcript scrollbar reach both ends and size its thumb to the content viewport
+- feat(tui): abbreviate large token counts with M, B, and T suffixes
+- fix(tui): use Shift+Enter for newlines and Ctrl+Enter for steering
+- style(tui): simplify footer hints, group selection with copying, and match answer prose to its label color
+- style(tui): add half-height vertical padding to chat user prompts
+- refactor(cli): remove the built-in review command and the README command listing
+
+## [v0.34.12] - 2026-11-06
+
+- feat(tui): add compact reasoning disclosures, expanded by default; click headers to toggle individual blocks or use `Ctrl+R` to toggle all
+- fix(tui): preserve reasoning disclosure state while streaming, raw-text copying, and scroll position; resume reasoning expanded
+- style(tui): use upright prose, readable secondary reasoning, and small accented answer labels without changing tool formatting or `Ctrl+T`
+- fix(tui): simplify footer shortcut hints
+- test(tui): cover reasoning disclosures across themes, terminal sizes, streaming, replay, copying, and scrolling
+
+## [v0.34.11] - 2026-11-06
+
+- refactor(agent): remove helper agents, teams, delegation, and their configuration and UI; retain single-agent parallel tool execution
+- feat(catalog): refresh model metadata and expand provider coverage
+- fix(tui): show compact decimal token counts in the footer, chat, and usage popup; display popup costs to three decimal places
+- fix(tui): improve footer token, context, spend, and file-hint layout
+- feat(cli): add `/exit` as an alias for `/quit` and group both commands in help
+
+## [v0.34.10] - 2026-11-05
+
+- refactor(session): find and resume saved sessions by their opening prompt with `/sessions`, `/hot-reload`, and `--resume`
+- fix(tui): remove internal session IDs from the footer and session listings
+- test(session): cover prompt searches, ambiguous matches, and continued transcript recording
+
+## [v0.34.9] - 2026-11-04
+
+- feat(catalog): add Particle-1 and GLM 5.3 FlashX Legal for OpenRouter
+- fix(catalog): refresh model pricing, token limits, and reasoning metadata; remove Laguna S 2.1
+- test(catalog): verify new reasoning scales and provider-specific token limits
+
+## [v0.34.8] - 2026-11-04
+
+- feat(agent): keep solo workflows free of team services and activate collaboration only when used
+- fix(team): archive shared evidence and preserve helper memory and usage when returning to solo mode
+- test(agent): cover solo/team lifecycle and matched tool-parallelism benchmarks
+- chore(deps): update ACP, AWS Smithy types, ignore, Tokio Util, and unicode-width
+
+## [v0.34.7] - 2026-11-01
+
+- fix(tui): use Ctrl+Enter for prompt newlines and Alt+Enter for agent steering
+- test(tui): verify the swapped bindings while idle, running, and answering questions
+
+## [v0.34.6] - 2026-10-31
+
+- fix(team): show standalone-style tool-call details, including file paths, line ranges, search arguments, commands, and patch summaries
+- test(team): verify distinct tool-call descriptions, shared-only notifications, and Ctrl+B visibility
+
+## [v0.34.5] - 2026-10-31
+
+- fix(tui): keep final answers below live team updates and toggle updates with Ctrl+B
+- fix(team): identify helpers, lead models, and helper tool calls without repeating handoff snapshots
+- test(tui): verify agent Markdown, stable selection, and model attribution on replay
+- chore: stop tracking local benchmark scripts
+
+## [v0.34.4] - 2026-10-31
+
+- docs(team): describe configured review workflow
+- test(team): verify Developer and Reviewer lifecycle
+- feat(team): define Developer and Reviewer handoffs
+- fix(review): allow requested standalone Markdown reports
+- fix(roles): preserve supported helper responsibilities
+- Define coding guidelines (#112)
+- feat(tui): add theme examples to repository
+- style: simplify code comments and remove field documentation (#110)
+- feat(config): add implementer team agent
+
+## [v0.34.3] - 2026-10-30
+
+- chore: ignore generated coding-agent examples
+- docs(team): describe selective handoffs and helper result delivery
+- test(team): trace live handoffs and reconcile workflow usage
+- fix(team): scope shared knowledge and defer helper initialization
+- fix(agent): keep background outside active tool exchanges
+- fix(core): preserve complete Anthropic tool schemas
+
+## [v0.34.2] - 2026-10-30
+
+- chore: keep development benchmarks outside packaging
+
+## [v0.34.1] - 2026-10-30
+
+- docs: reduce the README to setup, everyday usage, and essential configuration; simplify helper teams and ACP, remove client examples and benchmark tables
+- chore(deps): update base64, sha2, unicode-normalization, grep-searcher, and ignore
+- ci: update Dependabot configuration
+
+## [v0.34.0] - 2026-10-28
+
+- feat(settings): user-defined helper agents and explicit command mappings, protected by project trust
+- feat(crew): lazy private histories, bounded exchanges, changed-file reporting, persistence, and per-agent spend
+- feat(tui): direct `/agent` calls, session teams, opt-in defaults, and typed startup commands
+- feat(team): persistent shared discussion with bounded request-time projections
+- feat(team): recursive delegation with shared budgets, cycle-free queues, subtree cancellation, and checkout write coordination
+- feat(team): explainable role discovery subordinate to explicit choices and actual permissions
+- fix(tui): preserve streamed answers when discussion updates arrive
+- test(team): verify baseline and expanded multi-agent workflows against live Fireworks and a real terminal
+
+## [v0.33.13] - 2026-10-27
+
+- feat(models): default OpenAI and Codex to GPT-6.1 Sol
+- feat(catalog): expand Fireworks and OpenRouter models
+
+## [v0.33.12] - 2026-10-27
+
+- feat(catalog): add GPT-6.1 Terra for OpenAI and Codex
+
+## [v0.33.11] - 2026-10-27
+
+- ci: prepare release metadata before tagging
+- ci: simplify test and release workflows
+- reduce the complexity in the ci
+- fix: correct OpenRouter credential hint
+
+## [v0.33.10] - 2026-10-27
+
+- feat: report agent status through OSC 7501
+- feat(providers): support Anthropic and Bedrock gateways
+- fix(deps): preserve similar 3 in sha2 upgrade
+- ci: auto-merge release bookkeeping PRs
+- update .gitignore
+- chore(deps): bump getrandom from 0.3.4 to 0.4.3
+- chore(deps): bump sha2 from 0.10.9 to 0.11.0
+- chore(deps): bump serde from 1.0.228 to 1.0.229
+- chore(deps): bump async-trait from 0.1.89 to 0.1.92
+- chore(deps): bump similar from 2.7.0 to 3.2.0
+- chore(deps): bump actions/download-artifact from 4.3.0 to 8.0.2
+
+## [v0.33.9] - 2026-10-25
+
+- fix(ci): propose release metadata through pull requests
+
+## [v0.33.8] - 2026-10-25
+
+- fix(ci): correct macOS universal architecture verification
+
+## [v0.33.6] - 2026-10-25
+
+- fix(docs): cupel fixed some typos in the README
+- feat(example): smoke test for using ACP in OpenHands and Zed
+- feat(acp): add persistent stdio agent frontend
+- refact(startup): share frontend model and thinking selection
+
+## [v0.33.5] - 2026-10-24
+
+- refactor: replace mod.rs with named module files
+- feat(usage): cover modal input history and replay.
+- feat(usage): aggregate model usage from saved sessions.
+
+## [v0.33.4] - 2026-10-23
+
+- feat: expansion of the openrouter model catalog
+
+## [v0.33.3] - 2026-10-22
+
+- feat: remove outdated models
+
+## [v0.33.2] - 2026-10-22
+
+- feat(core): update provider models. add minimax m3.1 flash to openrouter and deepseek v4.1 flash to fireworks
+- feat(tui): move model and effort level from footer above prompt pane
+- fix(cert): update crates version to handle affected certificates
+
+## [v0.33.1] - 2026-10-21
+
+- feat(tui): give open questions a padded decision pane
+- docs: update feature overview
+- docs: modify and explain how to contribute to cupel
+
+## [v0.33.0] - 2026-10-18
+
+- feat(tui): answer the agent's questions above the input box
+- feat(tools): ask_user puts a design question to the user.
+- feat(agent): spare results a tool cannot reproduce from compaction
+
+## [v0.32.1] - 2026-10-18
+
+- feat(catalog): update OpenRouter DeepSeek V4.1 Flash to 1017
+
+## [v0.32.0] - 2026-10-18
+
+- feat(tui): restart into the installed release
+- feat(tui): /update installs the newest release
+- feat(update): install a newer release in palce of install.sh's binary
+- feat(tui): announce a newer release once per launch
+- feat(update): check GitHub for latest version
+
+## [v0.31.2] - 2026-10-17
+
+- chore: remove unnecessary themes entries from .gitignore
+- refactor(tui): move palette themes from Rust to JSON files
+
+## [v0.31.1] - 2026-10-17
+
+- feat(tui): load custom themes from separate JSON files
+
+## [v0.31.0] - 2026-10-16
+
+- feat(tui): color Markdown like Zed's editor in palette themes
+- feat(catalog): plan codex/gpt-6.1-sol at Codex's 500k default window
+
+## [v0.30.0] - 2026-10-16
+
+- docs(readme): describe themes and custom palettes
+- fix(tui): add vertical conversation padding
+- feat(tui): add switchable color themes
+- feat(config): persist the TUI theme
+- fix(release): rebase the changelog commit before pushing to main
+- ci: remove the sync-version and version workflows
+- docs(changelog): list the commits of the failed v0.28.0 and v0.29.0 releases
+
+## [v0.29.3] - 2026-10-14
+
+- fix(version): release will now correctly updates version
+- fix(session): session --resume failes when provided anything other than valid session id
+- refact(tui): remove titles, left, and right borders from promp and coversation blocks
+
+## [v0.29.2] - 2026-10-13
+
+- feat(catalog): add Muse Wonder on OpenRouter
+
+## [v0.29.1] - 2026-10-13
+
+- fix(release): add missing prefix v to handle version number
+- feat(catalog): add Gemini 4 Argon on OpenRouter
+- feat(version): update release pipeline to add the latest version
+- fix(thinking): off on a model that cannot turn reasoning off uses its lowest level
+- feat(tui): show what the agent does and how long it worked
+- feat(agent): announce every model request with TurnStart
+- feat(tui): render thinking as markdown, show reasoning tokens
+- fix: steering comment slips and a gap before the footer version
+- feat(catalog): add GPT-6.1 Sol Ultrafast for openai and openai-codex
+- feat(core): send requestModel and serviceTier on both Responses dialects
+- feat(tui): display the current version in the footer
+
+## [v0.27.0] - 2026-10-10
+
+- fix(auth): never write an older codex login back, explain a rejected one
+- test(catalog): check relations instead of models.dev numbers, and the snapshot itself
+- fix(auth): adopt rotated codex tokens and bound the refresh
+- fix(compat): parse compat per key and report problems at catalog load
+- fix(config): isolate providers and loopKiller, refuse an invalid default preset
+- fix(core): align retry and overflow decisions on status and panics
+- fix(core): classify transport failures and early stream ends by kind
+- fix(gitignore): track every path under crates/
+- fix(agent): estimate seeded history from content until a fresh reply
+- fix(bedrock): read Claude capabilities from catalog compat
+- refactor(providers): share stream, status, effort and tool-id plumbing
+- fix(catalog): generate from a versioned models.dev snapshot
+- fix(auth): retain valid access tokens after refresh failures
+- fix(config): isolate invalid presets and warn on compat errors
+- fix(core): preserve inference error kinds for retry classification
+- fix(core): redact StreamOptions API key in Debug output
+- fix(tui): batch ready background events before redrawing
+- fix(tui): initialize warnings in signal test fixture
+- feat: add active-run steering and refresh TUI user messages
+
+## [v0.26.0] - 2026-10-08
+
+- feat(tui): use white italics and double-chevron task prompts
+- chore(session): use neutral slug fixtures and trim label docs
+- docs(core): trim device-auth polling and timestamp comments
+- Remove Mistral from catalog and overflow handling
+- feat(catalog): take GPT-6.1 Sol from models.dev, add it on OpenRouter
+- chore(catalog): sync prices and limits from models.dev
+- feat(catalog): add Mistral Large 4, MiMo V2.6, Ember-1 and Fireworks Inkling
+- chore(catalog): sync Sonnet and OpenRouter rows from models.dev
+- feat(anthropic): replace Haiku 4.5 with Haiku 5.5
+
+## [v0.25.0] - 2026-10-06
+
+- feat(spinoff): commit messages for /spinoff merge
+- fix(plain): clean up gracefully on broken pipes
+- feat(spinoff): restore spinoffs after a restart
+- fix(spinoff): text slips, drop and busy tests
+- test(tui): fix WouldBlock flake in the project-trust fixture on macOS
+- feat(spinoff): merge and drop spinoffs, archive their sessions
+- feat(spinoff): warn about conflicts between sessions after every run
+- fix(spinoff): message typos, spinoff id, popup width
+- fix(providers): avoid image placeholders for empty tool results
+- feat(spinoff): run spinoffs as sessions with a sidebar
+- fix(tui): distinguish planning and assumed context limits
+- feat(spinoff): git core for parallel sessions in worktrees
+- update ci and release with macos-latest
+
+## [v0.24.0] - 2026-10-03
+
+- fix(tui): keep the spinner turning while a reply streams
+- fix: explain content-filter stops and preserve partial output and usage across providers
+- fix: report missing Anthropic message_start and Bedrock MessageStop as retryable stream errors
+- fix(compaction): reset usage limits after pruning and compaction
+- fix(ollama): adjust compaction threshold for context tail based on real model context window
+
+## [v0.23.0] - 2026-10-02
+
+- fix(tui): sanatize transcript text before rendering
+- fix(trust): define project trustworthiness and enable hooks
+- fix(bedrock thinking): disable thinking for selection off for Bedrock API
+- fix(retry): fetch and handle 4xx correctly to not retry failing requests indefinitely
+- fix(markdown): fallback renders exhaustive symbol with current.push(c) instead of square brackets
+- fix(new): end current session and create new session based on reload_resume
+- fix(apply_patch): inplace update file when renaming by using apply_patch
+- fix(compaction): compaction now waits for next assistant message to include tool result
+
+## [v0.22.0] - 2026-10-01
+
+- fix(tui): keep a bare cargo run launching cupel
+- docs: build and install cupel from the cupel-tui package
+- refactor(workspace): move the TUI and the cupel binary into cupel-tui
+
+## [v0.21.3] - 2026-09-29
+
+- change spinner in flux
+
+## [v0.21.2] - 2026-09-29
+
+- add GPT-6.1 Sol to OpenAI model catalog
+
+## [v0.21.1] - 2026-09-29
+
+- feat(catalog): add Claude Fable 5.1 on Anthropic and Bedrock
+- update model catalog
+
+## [v0.21.0] - 2026-09-29
+
+- fix(loop-killer): keep the veto message on one line
+- docs: adjust CHANGELOG bullets
+- feat(bedrock): add Claude Sonnet 5.5 and stop capping xhigh/max
+- fix(thinking): drop thinking blocks invalidated by history edits
+- fix(catalog): keep generator error messages on one line
+- feat(catalog): add Claude Sonnet 5.5 with between_tools as its off switch
+- fix(catalog): replace retired Fireworks models
+
+## [v0.20.0] - 2026-09-27
+
+- feat(tui): queue prompts typed while the agent works
+- feat(agent): queue follow-up messages while a run is active
+- docs: fix code comments. reduce overhead. make it easier to read
+- docs(changelog): removed unnecessary bullet points
+
+## [v0.19.0] - 2026-09-27
+
+- feat: parse model presets from settings.json
+- docs: Reduktion der CHANGELOG.md
+- fix(retry): retry reqwest transport failures and show their cause
+
+## [v0.18.0] - 2026-09-26
+
+- fix: clean up plain-mode bash commands on termination
+- test(bash): tolerate CI scheduling gaps in background output
+- fix(bash): use bash instead of the user's login shell
+- fix(plain): fail on terminal model errors
+- fix(plain): submit piped stdin as one prompt
+- fix(plain): reject TUI-only commands and filter help
+- fix(plain): clean up captured output and command help
+- fix(bash): return when the shell exits, not when its pipes close
+- fix(catalog): remove Codex Spark from pinned models
+- fix(catalog): drop unsupported Codex GPT-5.4 rows
+- feat(cli): prefer Codex login and tune Sol thinking default
+- test(tui): verify /exit no longer quits
+
+## [v0.17.0] - 2026-09-24
+
+- Test Sonnet 5 and Opus 5 adaptive request bodies and off behavior
+- Move Claude Sonnet 5 and Opus 5 to adaptive thinking in the catalog
+- Add GPT-6 Sol and Luna across OpenAI, OpenRouter, and Codex catalogs
+- Add Claude Opus 5.5 with adaptive thinking and request-body tests
+- Refresh models.dev pricing and output limits for OpenRouter models
+- modify README. Make it more readable
+
+## [v0.16.1] - 2026-09-20
+
+- move commands in footer to align to the left
+
+## [v0.16.0] - 2026-09-20
+
+- move line-ending/BOM handling and diff rendering from edit_diff to text_diff behind apply_patch
+- replace write with apply_patch: one Begin/End Patch envelope creates, deletes, renames, and patches files, verified before any write
+- add the apply_patch parser and update-hunk matcher, a port of Codex's apply-patch crate
+
+## [v0.15.2] - 2026-09-16
+
+- add four Fireworks models: GLM 5.3, GLM 5.3 Flash, Qwen 3.8 Max, DeepSeek V4.1 Flash
+- add eight OpenRouter models: Kimi K3, GLM 5.3 Flash, DeepSeek V4 snapshots, Muse Spark 1.3, Inkling, Laguna S 2.1
+- repair model.dev drift in the catalog and sync Cargo.lock to v0.15.1
+
+## [v0.15.1] - 2026-09-16
+
+- update Rust version to 1.98.1 and adjust clippy hints for inline mods and inline trait bounds
+- move AGENTS.md to project directory
+
+## [v0.15.0] - 2026-09-14
+
+- adjust CI and bump version in Cargo.toml according to changelog
+- re-write code comments to simplify content and increase understanding
+- render the transcript as one framed column
+
+## [v0.14.0] - 2026-09-13
+
+- add version bump workflow with workspace-inherited crate versions
+- exclude changelog bot commits from generated release notes
+- add ranking to grep for targeted search
+
+## [v0.13.0] - 2026-09-12
+
+- make the agent's coding session visible in the TUI     - announce every transcript message with MessageEnd
+
+## [v0.12.0] - 2026-09-06
+
+- add GPT-6 Astra support and model-specific reasoning limits - add Astra to OpenAI, Codex, and OpenRouter catalogs - support max thinking level - omit temperature for models which do not support - separate planning windows from long-context - preserve and enforce context ceilings
+- create basic structures to integrate external tracing tools (i.e. logfire, Sentry)
+- modify CHANGELOG.md and add new structure to release notes
+
+## [v0.11.0] - 2026-09-01
+
+- add codex as another provider to access openai pro and max plans
+  * implement codex flow: const, credentials, authorization url, and token endpoints
+  * repair models.dev drift in the fireworks curation
+  * add the seven codex models: pinned curation rows, codex/ id namespace with requestModel compat, long-context tiers
+  * add auth.json credential store with auto-refresh: api_key hook resolves codex tokens per request, /login-aware startup selection
+  * add /login and /logout: browser oauth with paste fallback, device-code flow, esc cancel, provider status lines
+
+
+## [v0.10.1] - 2026-08-29
+
+- pin scrolled view while agent output grows
+
+## [v0.10.0] - 2026-08-29
+
+- refactor TUI layout to divide conversation and tool use
+  * define style builder, Color::Indexed as moveable area instead of color
+  * use index instead of reference to put reasoning side-by-side with tool calls
+  * create renderer for three vectors
+  * expand event handler so app receives ui updates
+
+## [v0.9.0] - 2026-08-27
+
+- add openrouter API to provider list expand model list
+
+## [v0.8.1] - 2026-08-24
+
+- add long-context price tiers for GPT-5.6 models
+  * add CostTier struct and optional tiers field on ModelCost (camelCase
+    serde, defaults to None so existing catalogs parse unchanged)
+  * calculate_cost picks the highest tier below the total prompt size
+    (input + cache_read + cache_write) and reprices the whole request
+    with tier rates
+  * teach the catalog generator to map models.dev tier.size thresholds
+    and regenerate catalog.json (three GPT-5.6 entries gain a 272k tier)
+  * derive Default on ModelCost and collapse nine all-zero struct
+    literals to ModelCost::default()
+
+## [v0.8.0] - 2026-08-24
+
+- replace hardcoded model catalog with generated catalog.json
+- Replace the hand-written Rust model catalog in cupel-core with a generated
+  JSON catalog embedded via include_str!.
+  * add dev-time `generate-catalog` bin that fetches model.dev,
+    applies curation tables (base URLs, API families, compat quirks,
+    thinking-level maps), validates, and writes catalog.json
+  * keep catalog data checked into git so it never runs on runtime
+  * reduce catalog.rs to a thin loader over the embbeded JSON
+  * set default-run = "cupel" to keep `cargo run` unambiguous with
+    two bin targets
+
+## [v0.7.0] - 2026-08-23
+
+- add Markdown renderer to format assistant output accordingly
+- set default thinking to medium
+- add loop killer to cupel and manage in project speific or home settings.json
+- adjust color themes with a unified theme.rs to manage TUI colors
+
+## [v0.6.0-beta] - 2026-08-18
+
+- define model provider configurations in settings.json   - parse file, ignore unknown fields, does not leak any secrets - independent module   - handle directory and serialize information, manage temp files   - create auto-save and hot-reload functionality for persistent API key
+- Removed unnecessary entries to README.md
+
+## [v0.5.4-beta] - 2026-08-02
+
+- remove unused code from codebase to make it more readable
+
+## [v0.5.3-beta] - 2026-07-31
+
+- adjust pricing for GPT-5.6 Terra and GPT-5.6 Luna
+- reduce CHANGELOG content
+
+## [v0.5.2-beta] - 2026-07-28
+
+- fix interactive ui test to handle model catalog
+- fix catalog tests and adjust model number
+
+## [v0.5.0-beta] - 2026-07-28
+
+- minor model updates to the default catalog
+
+## [v0.4.0-beta] - 2026-07-24
+
+- hot-reload: append the AGENTS.md delta in place instead of rebuilding
+
+## [v0.3.0-beta] - 2026-07-23
+
+- drop the shim's orphaned cupel-coding-agent workspace dependency
+- remove the Entire CLI integration
+- compaction: free pruning tier before the summarization LLM call
+
+## [v0.2.0-beta] - 2026-07-19
+
+- cupel is now able to do file or diff based reviews with just writing /review
+
+## [v0.1.16-beta] - 2026-07-18
+
+- start the TUI without credentials: warning notice instead of a fatal error
+
+## [v0.1.15-beta] - 2026-07-17
+
+- add /hot-reload: apply .cupel changes to a rebuilt session
+- show session ids in the TUI: footer id + /session-id listing
+- gitignore: whitelist cupel-coding-agent/tests (carries the guard e2e test)
+- add bash denylist guard: block rm -rf via the AgentHooks veto point
+
+## [v0.1.13-beta] - 2026-07-12
+
+- add local model support: models.json catalog layers + ollama discovery
+
+## [v0.1.12-beta] - 2026-07-12
+
+- change model provider in the TUI via /provider slash command
+- choose model by leveraging slash command /model via a popup
+- add auto-complete for model selection and thinking mode
+
+## [v0.1.11-beta] - 2026-07-12
+
+- add selection mode Ctrl+Y to use copy/paste in TUI
+- add entire-agent-cupel: Entire CLI external-agent shim (protocol v1)
+- cupel got persistency through session transcripts, lifecycle hooks, and session resuming
+
+## [v0.1.10-beta] - 2026-07-12
+
+- fix CI break while creating changelog
+
+## [v0.1.8-beta] - 2026-07-11
+
+- cupel now adds .cupel to root to keep project clean
+- update project documentation
+
+## [v0.1.7-beta] - 2026-07-11
+
+- adopt a dedicated cupel home directory (cargo layout): the binary installs
+  to `~/.cupel/bin`, global `AGENTS.md` and `prompts/` templates live next to
+  it, `memory/` is reserved for the future memory feature; override the
+  location with `CUPEL_HOME`
+
+## [v0.1.6-beta] - 2026-07-11
+
+- replace the skills feature with slash commands: markdown files in
+  `prompts/<name>.md` become `/name` prompt templates with bash-style
+  `$1`/`$@`/`${@:2}` argument substitution; `/` opens autocomplete in the TUI
+
+## [v0.1.5-beta] - 2026-07-10
+
+- fix CI format error
+
+## [v0.1.4-beta] - 2026-07-10
+
+- comment pass across the codebase for easier understanding
+
+## [v0.1.3-beta] - 2026-07-10
+
+- Homebrew packaging (`brew install` via tap) with an automated formula bump
+  in the release pipeline
+- update README.md to match the current implementation state
+
+## [v0.1.2-beta] - 2026-07-10
+
+- add `@file-path` references to the TUI: fuzzy search over project files and
+  inject the selected file into the conversation
+
+## [v0.1.1-beta] - 2026-07-03
+
+- fix bash tool error on Linux distributions
+
+## [v0.1.0-beta] - 2026-07-03
+
+Initial public release: a production-ready coding agent harness.
+
+- multi-provider inference layer with a built-in model catalog: Anthropic
+  (incl. Claude Code OAuth), OpenAI Responses API, Amazon Bedrock
+  ConverseStream, and Fireworks (with session affinity)
+- provider-neutral streaming: shared SSE decoder and reconstruction of tool
+  calls from streamed deltas
+- agent loop with auto-retry on transient provider errors
+- coding tools: read, edit, write, bash, and grep
+- context management: proactive auto-compaction (estimate the next request
+  size) plus reactive per-provider handling
+- eager `AGENTS.md`/`CLAUDE.md` project-context loading into the system prompt
+- tracing observability: per-request tokens/cost/duration, turns, tool
+  timings, retries, compaction
+- ratatui TUI (interactive mode) and `--plain` mode
+- release pipeline: universal macOS binary (arm64 + x86_64) and static musl
+  Linux binaries (x86_64, aarch64), installable via `install.sh`

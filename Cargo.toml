@@ -1,0 +1,196 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cupel-core",
+    "crates/cupel-agent",
+    "crates/cupel-coding-agent",
+    "crates/cupel-tui",
+    "crates/cupel-acp",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/rommeld/cupel"
+version = "0.35.2"
+
+[workspace.dependencies]
+cupel-core = { path = "crates/cupel-core" }
+cupel-agent = { path = "crates/cupel-agent" }
+cupel-coding-agent = { path = "crates/cupel-coding-agent" }
+
+async-trait = "0.1"
+aws-config = "1"
+# Keep the current HTTPS client without the legacy `rustls` default feature.
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-smithy-types = "1"
+base64 = "0.23"
+futures-core = "0.3"
+futures-util = "0.3"
+getrandom = "0.4"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+ratatui = "0.30.2"
+reqwest = { version = "0.13", features = ["form", "json", "stream"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+similar = "3"
+thiserror = "2"
+tokio = { version = "1.53.3", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-normalization = "0.1"
+unicode-width = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+restriction = { level = "warn", priority = -1 }
+
+absolute-paths = "allow"
+
+arbitrary_source_item_ordering = "allow"
+
+allow_attributes = "allow"
+allow_attributes_without_reason = "allow"
+
+arithmetic_side_effects = "allow"
+
+as_conversions = "allow"
+
+assertions_on_result_states = "allow"
+
+cast_possible_truncation = "allow"
+
+cognitive_complexity = "allow"
+
+assigning_clones = "allow"
+
+blanket_clippy_restriction_lints = "allow"
+
+cast_precision_loss = "allow"
+
+default_numeric_fallback = "allow"
+
+exhaustive_enums = "allow"
+exhaustive_structs = "allow"
+
+decimal_literal_representation = "allow"
+separated_literal_suffix = "allow"
+non_ascii_literal = "allow"
+
+doc_lazy_continuation = "allow"
+doc_markdown = "allow"
+doc_paragraphs_missing_punctuation = "allow"
+missing_panics_doc = "allow"
+
+else_if_without_else = "allow"
+
+exit = "allow"
+
+filetype_is_file = "allow"
+
+format_push_string = "allow"
+
+expect_used = "allow"
+
+field_reassign_with_default = "allow"
+
+float_arithmetic = "allow"
+
+implicit_return = "allow"
+
+impl_trait_in_params = "allow"
+
+indexing_slicing = "allow"
+string_slice = "allow"
+
+inline_modules = "allow"
+
+integer_division = "allow"
+integer_division_remainder_used = "allow"
+
+large_futures = "allow"
+
+items_after_statements = "allow"
+
+if_not_else = "allow"
+
+let_underscore_untyped = "allow"
+let_underscore_must_use = "allow"
+unused_result_ok = "allow"
+
+map_unwrap_or = "allow"
+
+manual-let-else = "allow"
+
+min-ident-chars = "allow"
+
+missing_docs_in_private_items = "allow"
+missing_errors_doc = "allow"
+missing_inline_in_public_items = "allow"
+missing_trait_methods = "allow"
+
+module_name_repetitions = "allow"
+
+needless_pass_by_value = "allow"
+needless_raw_strings = "allow"
+
+pattern_type_mismatch = "allow"
+
+print_stdout = "allow"
+print_stderr = "allow"
+
+pub_use = "allow"
+pub_with_shorthand = "allow"
+pub_without_shorthand = "allow"
+
+question_mark_used = "allow"
+
+self_named_module_files = "allow"
+
+semicolon_outside_block = "allow"
+
+shadow_unrelated = "allow"
+shadow_reuse = "allow"
+shadow_same = "allow"
+
+similar_names = "allow"
+
+struct_excessive_bools = "allow"
+
+unnecessary_literal_bound = "allow"
+
+single_call_fn = "allow"
+single_char_lifetime_names = "allow"
+
+single_match_else = "allow"
+
+std_instead_of_alloc = "allow"
+std_instead_of_core = "allow"
+
+str-to-string = "allow"
+
+too_many_lines = "allow"
+
+
+unwrap_used = "allow"
+panic = "allow"
+
+unwrap_in_result = "allow"
+
+unused_trait_names = "allow"
+
+wildcard-enum-match-arm = "allow"

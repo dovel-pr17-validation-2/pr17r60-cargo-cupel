@@ -1,0 +1,794 @@
+//! `cupel` entry point, parse args, wire the agent, pick a frontend.
+//!
+//! Run `cupel` with optional model, thinking and plain mode options.
+//! Thinking accepts off, minimal, low, medium, high, xhigh or max.
+//!
+//! Frontend selection, the ratatui TUI when both stdin and stdout are real
+//! terminals, the plain frontend when either is piped or when plain mode is
+//! given. Non TTY stdin is consumed as one prompt, TTY stdin uses a line REPL.
+//!
+//! Model selection, the model option picks from the built in catalog, without it,
+//! the `default` preset from settings.json decides, without that, a
+//! ChatGPT login defaults to OpenAI Codex, otherwise the first provider
+//! with credentials wins in catalog order.
+//! Thinking defaults to the default preset's level, else to medium (high
+//! for Codex GPT 6 Sol), thinking off disables it.
+
+use std::io::IsTerminal as _;
+use std::sync::Arc;
+
+use cupel_agent::{Agent, AgentOptions, ToolExecutionMode};
+use cupel_coding_agent::bootstrap::Frontend;
+use cupel_coding_agent::modes::{self, SessionMeta};
+use cupel_coding_agent::settings::{DEFAULT_PRESET, Preset, Settings};
+use cupel_coding_agent::startup::ThinkingChoice;
+use cupel_core::types::{Model, ThinkingLevel};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum AppError {
+    #[error("argument error: {0}")]
+    Arguments(String),
+    #[error("could not determine current directory")]
+    CurrentDirectory(#[source] std::io::Error),
+    #[error("model selection error: {0}")]
+    ModelSelection(String),
+    #[error("session error: {0}")]
+    Session(String),
+    #[error("plain-mode error: {0}")]
+    PlainMode(String),
+    #[error("interactive-mode error: {0}")]
+    InteractiveMode(#[source] std::io::Error),
+}
+
+fn main() -> std::process::ExitCode {
+    // Build the runtime explicitly instead of Tokio's main attribute. It does the same thing,
+    // but you can see the moving part.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    match runtime.block_on(run()) {
+        Ok(None) => std::process::ExitCode::SUCCESS,
+        Ok(Some(restart)) => restart_into(&restart),
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Become the new cupel in this process, keeping its terminal, directory and
+/// environment. The TUI has restored the terminal before this runs. `exec` returns
+/// only when starting the new binary failed.
+fn restart_into(restart: &cupel_tui::sessions::Restart) -> std::process::ExitCode {
+    use std::os::unix::process::CommandExt as _;
+    eprintln!("{}", restart.note);
+    let error = std::process::Command::new(&restart.binary)
+        .args(&restart.args)
+        .exec();
+    eprintln!(
+        "error: cannot start {}: {error}\nstart it yourself: cupel {}",
+        restart.binary.display(),
+        restart.args.join(" ")
+    );
+    std::process::ExitCode::FAILURE
+}
+
+/// What the resume option asked for, the newest session of this project, or one
+/// found by its opening prompt.
+enum ResumeTarget {
+    Latest,
+    Search(String),
+}
+
+struct CliArgs {
+    model: Option<String>,
+    thinking: ThinkingChoice,
+    plain: bool,
+    resume: Option<ResumeTarget>,
+}
+
+/// Parameterized on the iterator (instead of reading `args`
+/// internally) so tests can drive it without process global state.
+fn parse_args(args: impl Iterator<Item = String>) -> Result<CliArgs, String> {
+    let mut parsed = CliArgs {
+        model: None,
+        thinking: ThinkingChoice::Default,
+        plain: false,
+        resume: None,
+    };
+    let mut iter = args.peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--model" | "-m" => {
+                parsed.model = Some(iter.next().ok_or("--model requires a value")?);
+            }
+            "--thinking" | "-t" => {
+                let value = iter.next().ok_or("--thinking requires a value")?;
+                parsed.thinking = value.parse()?;
+            }
+            "--plain" => parsed.plain = true,
+            // The search is optional, a bare resume option (next arg missing or
+            // another flag) means "the newest session of this project".
+            "--resume" | "-r" => {
+                parsed.resume = match iter.peek() {
+                    Some(next) if !next.starts_with('-') => {
+                        Some(ResumeTarget::Search(iter.next().expect("peeked")))
+                    }
+                    _ => Some(ResumeTarget::Latest),
+                };
+            }
+            "--help" | "-h" => {
+                let mut help = String::from(
+                    "usage: cupel [--model <id>] [--thinking off|minimal|low|medium|high|xhigh|max (default: medium; high for codex/gpt-6-sol)] [--resume [\"prompt search\"]] [--plain]\n\navailable models:\n",
+                );
+                // Built ins + models.json layers, deliberately not the
+                // ollama probe because help must be instant and never touch the
+                // network. Discovered models appear in the TUI's /model.
+                let home = cupel_coding_agent::resources::config_home();
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let (models, warnings) =
+                    cupel_coding_agent::models::build_catalog_offline(home.as_deref(), &cwd);
+                for warning in warnings {
+                    eprintln!("{warning}");
+                }
+                for model in models {
+                    help.push_str(&format!("  {} ({})\n", model.id, model.provider.as_str()));
+                }
+                // `print!` panics when stdout is a pipe whose reader closed
+                // early (help output piped into head). Writing explicitly and
+                // ignoring the error is the unsafe free version of the usual
+                // "reset SIGPIPE" fix.
+                use std::io::Write as _;
+                let _ = std::io::stdout().write_all(help.as_bytes());
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(parsed)
+}
+
+fn thinking_level(args: &CliArgs, model: &Model, preset: Option<&Preset>) -> Option<ThinkingLevel> {
+    cupel_coding_agent::startup::thinking_level(args.thinking, model, preset)
+}
+
+fn select_model(
+    args: &CliArgs,
+    catalog: &[Model],
+    settings: &Settings,
+    home: Option<&std::path::Path>,
+) -> Result<(Model, Option<String>), String> {
+    cupel_coding_agent::startup::select_model(args.model.as_deref(), catalog, settings, home)
+}
+
+/// Install the tracing subscriber. This is the one place in the whole workspace
+/// that consumes trace data (libraries only emit).
+///
+/// Opt in via `RUST_LOG`, without it no subscriber exists and every
+/// `tracing` macro in the libraries compiles down to a branch on a static.
+/// Examples,
+///   RUST_LOG=cupel_core=info,cupel_agent=info   requests, turns, tools, cost
+///   RUST_LOG=cupel_core=trace                   + full request bodies
+///
+/// Writer selection, plain mode logs to stderr (standard, pipe friendly),
+/// the TUI logs to a file because anything written to the terminal would
+/// corrupt the ratatui screen. Returns the log file path in that case.
+fn init_tracing(interactive: bool) -> Option<std::path::PathBuf> {
+    use tracing_subscriber::fmt::format::FmtSpan;
+
+    // No RUST_LOG, no subscriber, no overhead.
+    std::env::var("RUST_LOG").ok()?;
+    let filter = tracing_subscriber::EnvFilter::from_default_env();
+
+    // CLOSE prints a line when each span ends, with its measured
+    // duration. That's where provider request and agent run timing comes
+    // from (the events themselves don't carry durations).
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_span_events(FmtSpan::CLOSE);
+
+    if interactive {
+        let path = std::env::temp_dir().join(format!("cupel-{}.log", std::process::id()));
+        let file = std::fs::File::create(&path).ok()?;
+        builder
+            .with_ansi(false) // no color codes in files
+            .with_writer(std::sync::Mutex::new(file))
+            .init();
+        Some(path)
+    } else {
+        builder.with_ansi(false).with_writer(std::io::stderr).init();
+        None
+    }
+}
+
+fn use_plain_mode(args: &CliArgs, stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
+    args.plain || !stdin_is_terminal || !stdout_is_terminal
+}
+
+/// `Some` when `/update` installed a release that cupel should restart into.
+async fn run() -> Result<Option<cupel_tui::sessions::Restart>, AppError> {
+    let args = parse_args(std::env::args().skip(1)).map_err(AppError::Arguments)?;
+    let use_plain = use_plain_mode(
+        &args,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    );
+    if let Some(log_path) = init_tracing(!use_plain) {
+        // Announced before the TUI takes the screen, visible in scrollback.
+        eprintln!("logging to {}", log_path.display());
+    }
+    let cwd = std::env::current_dir().map_err(AppError::CurrentDirectory)?;
+    // Note, the project .cupel/ directory is not scaffolded here because the
+    // frontends create it on the first agent interaction (resources,
+    // ensure_project_dot_cupel), so just launching cupel leaves no trace.
+
+    // load reads everything reloadable (context files, prompt
+    // templates, model catalog incl. the bounded ollama probe, bash deny
+    // rules, tools) in one place. The TUI's /hot reload runs the same
+    // loader, so a reload can never drift from a fresh start.
+    let registry = Arc::new(cupel_core::default_registry());
+    let home = cupel_coding_agent::resources::config_home();
+    // Confirm before any project model reaches credential resolution or
+    // any lifecycle hook can run. Piped stdin must never answer a popup.
+    if !use_plain && std::io::stdin().is_terminal() {
+        // Bootstrap has not read settings yet. Invalid themes fall back
+        // here, the TUI surfaces the settings warnings once it starts.
+        let (home_settings, _) = cupel_coding_agent::settings::load_home_settings(home.as_deref());
+        let (theme_files, _) = cupel_coding_agent::themes::load_theme_files(home.as_deref());
+        let themes = cupel_tui::theme::registry(&theme_files);
+        let theme = cupel_tui::theme::from_settings(&themes, home_settings.theme.as_deref())
+            .unwrap_or_else(|_| Arc::clone(&themes[0]));
+        cupel_tui::project_trust::confirm(home.as_deref(), &cwd, &theme)
+            .map_err(AppError::InteractiveMode)?;
+    } else if !cupel_coding_agent::project_trust::is_trusted(home.as_deref(), &cwd) {
+        eprintln!(
+            "project is not trusted: project hooks and sensitive model rows are disabled; \
+             start cupel interactively to confirm project trust"
+        );
+    }
+    // Only the TUI can answer the agent's questions (see `Frontend`).
+    let frontend = if use_plain {
+        Frontend::Plain
+    } else {
+        Frontend::Tui
+    };
+    let mut ingredients =
+        cupel_coding_agent::bootstrap::load(&cwd, home.clone(), &registry, frontend).await;
+    // Surface plain mode warnings before model selection can fail. In the
+    // TUI they travel with SessionMeta, never through the alternate screen.
+    if use_plain {
+        for warning in &ingredients.warnings {
+            eprintln!("{warning}");
+        }
+    }
+
+    // No credentials is fatal only where it is unrecoverable. The TUI can
+    // fix it at runtime (a provider switch with an API key, `/model`), so it
+    // starts anyway on a fallback model and shows the message as its first
+    // notice. Plain mode has no such commands and keeps the hard error.
+    // An explicit the model option that fails stays fatal in both modes, a typo
+    // should not silently start something else. The same goes for the
+    // default preset's model.
+    let preset = ingredients.settings.presets.get(DEFAULT_PRESET);
+    let explicit_default =
+        preset.is_some() || ingredients.settings.invalid_default_preset.is_some();
+    let (model, api_key, startup_warning) = match select_model(
+        &args,
+        &ingredients.models,
+        &ingredients.settings,
+        home.as_deref(),
+    ) {
+        Ok((model, key)) => (model, key, None),
+        Err(e) if !use_plain && args.model.is_none() && !explicit_default => {
+            let fallback = ingredients
+                .models
+                .iter()
+                .find(|m| m.provider.as_str() == "openai-codex")
+                .or_else(|| ingredients.models.first())
+                .cloned()
+                .ok_or_else(|| AppError::ModelSelection(e.clone()))?;
+            let warning = format!(
+                "{e}\n\nstarted without credentials on {} - requests will fail until you \
+                 `/provider <name> <api-key>`, switch to a local model via /model, or \
+                 restart with a key exported",
+                fallback.id
+            );
+            (fallback, None, Some(warning))
+        }
+        Err(e) => return Err(AppError::ModelSelection(e)),
+    };
+
+    // Resume keeps the original session id, so the recorder appends to the
+    // same transcript file and external consumers see one continuous
+    // session. The seeded messages flow into AgentOptions.messages below.
+    let (session_id, seeded_messages) = match &args.resume {
+        None => (format!("cupel-{}", cupel_core::types::now_ms()), Vec::new()),
+        Some(target) => {
+            let path = match target {
+                ResumeTarget::Search(query) => {
+                    cupel_coding_agent::session::sessions_dir(home.as_deref(), &cwd)
+                        .ok_or_else(|| {
+                            "session persistence is disabled (no cupel home)".to_string()
+                        })
+                        .and_then(|dir| cupel_coding_agent::session::find_session_in(&dir, query))
+                        .map_err(AppError::Session)?
+                }
+                ResumeTarget::Latest => {
+                    cupel_coding_agent::session::find_latest(home.as_deref(), &cwd)
+                        .ok_or("no previous session to resume for this project")
+                        .map_err(|message| AppError::Session(message.to_string()))?
+                }
+            };
+            let (header, messages) =
+                cupel_coding_agent::session::load_transcript(&path).map_err(AppError::Session)?;
+            (header.session_id, messages)
+        }
+    };
+    let recorder = cupel_coding_agent::session::SessionRecorder::new(
+        home.clone(),
+        &cwd,
+        &session_id,
+        &model.id,
+    );
+    ingredients.bind_session(&recorder, &cwd);
+    let preset = ingredients.settings.presets.get(DEFAULT_PRESET);
+
+    let mut options = AgentOptions::new(model.clone(), registry);
+    options.system_prompt = cupel_coding_agent::system_prompt::with_preset_prompt(
+        &ingredients.system_prompt,
+        preset.and_then(|preset| preset.prompt.as_deref()),
+    );
+    options.tools = ingredients.tools;
+    options.api_key = api_key;
+    options.thinking_level = thinking_level(&args, &model, preset);
+    options.tool_execution = ToolExecutionMode::Parallel;
+    options.session_id = Some(session_id);
+    options.messages = seeded_messages;
+    // The bash denylist guard and loop killer ride the agent loop's before_tool_call
+    // veto point (see guard.rs, loop_killer.rs, ...).
+    options.hooks = Arc::new(ingredients.hooks);
+    let agent = Agent::new(options);
+
+    let meta = SessionMeta {
+        model_name: model.name.clone(),
+        provider: model.provider.as_str().to_string(),
+        cwd: cwd.display().to_string(),
+        templates: ingredients.templates,
+        models: ingredients.models,
+        settings: ingredients.settings,
+        home,
+        startup_warning,
+        warnings: ingredients.warnings,
+        context_files: ingredients.context_files,
+        base_system_prompt: ingredients.system_prompt,
+    };
+
+    // The TUI takes over the whole screen, that only makes sense on a real
+    // terminal. Piped input or output (cat issue.md | cupel, CI logs) gets plain mode.
+    if use_plain {
+        modes::plain::run(agent, &meta, recorder)
+            .await
+            .map_err(AppError::PlainMode)?;
+        return Ok(None);
+    }
+    let exit = cupel_tui::run(agent, meta, recorder, ingredients.questions)
+        .await
+        .map_err(AppError::InteractiveMode)?;
+    Ok(match exit {
+        cupel_tui::Exit::Quit => None,
+        cupel_tui::Exit::Restart(restart) => Some(restart),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<CliArgs, String> {
+        parse_args(args.iter().map(ToString::to_string))
+    }
+
+    #[test]
+    fn restart_exec_preserves_process_context() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::{Command, Stdio};
+
+        // Exercise exec in a child so the test runner is never replaced.
+        if let Some(binary) = std::env::var_os("CUPEL_RESTART_EXEC_CHILD") {
+            let restart = cupel_tui::sessions::Restart {
+                binary: binary.into(),
+                args: [
+                    "--model",
+                    "a model with spaces",
+                    "--thinking",
+                    "high",
+                    "--resume",
+                    "cupel-test",
+                ]
+                .map(ToString::to_string)
+                .to_vec(),
+                note: "restarting test fixture".to_string(),
+            };
+            let status = restart_into(&restart);
+            panic!("exec unexpectedly returned {status:?}");
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "cupel-restart-exec-{}-{}",
+            std::process::id(),
+            cupel_core::types::now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let binary = root.join("cupel");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\nprintf 'restart-fixture\\n%s\\n%s\\n%s\\n' \
+                \"$$\" \"$PWD\" \"$CUPEL_RESTART_SENTINEL\"\nprintf '%s\\n' \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::restart_exec_preserves_process_context",
+                "--nocapture",
+            ])
+            .env("CUPEL_RESTART_EXEC_CHILD", &binary)
+            .env("CUPEL_RESTART_SENTINEL", "preserved")
+            .current_dir(&root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let expected = format!(
+            "restart-fixture\n{pid}\n{}\npreserved\n--model\na model with spaces\n\
+            --thinking\nhigh\n--resume\ncupel-test\n",
+            root.display()
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&expected),
+            "{output:?}"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("restarting test fixture"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_restart_returns_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "cupel-restart-missing-{}-{}",
+            std::process::id(),
+            cupel_core::types::now_ms()
+        ));
+        let restart = cupel_tui::sessions::Restart {
+            binary: root.join("cupel"),
+            args: vec!["--resume".to_string(), "cupel-test".to_string()],
+            note: "restarting".to_string(),
+        };
+        assert_eq!(restart_into(&restart), std::process::ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn frontend_selection_requires_terminal_stdin_and_stdout_for_tui() {
+        let args = parse(&[]).unwrap();
+        let plain_args = parse(&["--plain"]).unwrap();
+        for (stdin_is_terminal, stdout_is_terminal, expected_plain) in [
+            (true, true, false),
+            (false, true, true), // Piped stdin with terminal stdout must not start the TUI.
+            (true, false, true),
+            (false, false, true),
+        ] {
+            assert_eq!(
+                use_plain_mode(&args, stdin_is_terminal, stdout_is_terminal),
+                expected_plain,
+                "stdin terminal: {stdin_is_terminal}, stdout terminal: {stdout_is_terminal}",
+            );
+            assert!(use_plain_mode(
+                &plain_args,
+                stdin_is_terminal,
+                stdout_is_terminal,
+            ));
+        }
+    }
+
+    #[test]
+    fn resume_flag_with_and_without_a_prompt_search() {
+        assert!(parse(&[]).unwrap().resume.is_none());
+        // Bare resume = newest session of this project.
+        assert!(matches!(
+            parse(&["--resume"]).unwrap().resume,
+            Some(ResumeTarget::Latest)
+        ));
+        // Shell quoting keeps a multiword search in one argument.
+        match parse(&["--resume", "fix the login bug"]).unwrap().resume {
+            Some(ResumeTarget::Search(query)) => assert_eq!(query, "fix the login bug"),
+            other => panic!("expected Search, got {:?}", other.is_some()),
+        }
+        // Followed by another flag, the flag is not eaten as a search.
+        let args = parse(&["--resume", "--plain"]).unwrap();
+        assert!(matches!(args.resume, Some(ResumeTarget::Latest)));
+        assert!(args.plain);
+    }
+
+    #[test]
+    fn unknown_arguments_still_error() {
+        assert!(parse(&["--bogus"]).is_err());
+        assert!(parse(&["--model"]).is_err(), "--model needs a value");
+    }
+
+    #[test]
+    fn removed_startup_flags_are_unknown_arguments() {
+        assert!(parse(&["--plain", "--review"]).is_err());
+        assert!(parse(&["--review", "--review"]).is_err());
+        for flag in ["--review", "--team", "--add", "--agent"] {
+            assert_eq!(
+                parse(&[flag]).err().as_deref(),
+                Some(format!("unknown argument: {flag}").as_str())
+            );
+        }
+    }
+
+    /// A keyless local model (the ollama discovery shape). Tests use only
+    /// keyless catalogs so pass 1 of select_model (which reads real env
+    /// vars, process global and unmockable without unsafe) can never match,
+    /// keeping the tests environment independent.
+    fn keyless_model(id: &str) -> Model {
+        let mut model = cupel_core::catalog::builtin_models().remove(0);
+        // Local servers speak Chat Completions, the API that honors requiresApiKey.
+        model.api = cupel_core::types::Api::from(cupel_core::types::Api::OPENAI_COMPLETIONS);
+        model.id = id.to_string();
+        model.provider = cupel_core::types::Provider::from("ollama");
+        model.compat = Some(serde_json::json!({"requiresApiKey": false}));
+        model
+    }
+
+    #[test]
+    fn select_model_falls_back_to_keyless_local_models() {
+        let args = parse(&[]).unwrap();
+        let catalog = vec![keyless_model("qwen3:8b"), keyless_model("llama3:8b")];
+        let mut settings = Settings::default();
+        settings
+            .providers
+            .insert("test-cloud".into(), "from-settings".into());
+        // Pass 2, first keyless model wins, with no key.
+        let (model, key) = select_model(&args, &catalog, &settings, None).unwrap();
+        assert_eq!(model.id, "qwen3:8b");
+        assert!(key.is_none());
+
+        // Explicit model on a keyless entry also carries no key.
+        let args = parse(&["--model", "llama3:8b"]).unwrap();
+        let (model, key) = select_model(&args, &catalog, &settings, None).unwrap();
+        assert_eq!(model.id, "llama3:8b");
+        assert!(key.is_none());
+
+        // Empty catalog, the error mentions the local server escape hatch.
+        let args = parse(&[]).unwrap();
+        let err = select_model(&args, &[], &settings, None).unwrap_err();
+        assert!(err.contains("ollama"), "{err}");
+    }
+
+    /// A key requiring model on a provider id with no env var mapping,
+    /// env_api_key returns None on every machine, so only the settings
+    /// tier can supply a key. The test stays environment independent
+    /// (same trick as keyless_model above, other direction).
+    fn cloud_model(id: &str, provider: &str) -> Model {
+        let mut model = cupel_core::catalog::builtin_models().remove(0);
+        model.id = id.to_string();
+        model.provider = cupel_core::types::Provider::from(provider);
+        model.compat = None; // no requiresApiKeyfalse → a key is required
+        model
+    }
+
+    #[test]
+    fn select_model_picks_codex_when_logged_in() {
+        let args = parse(&[]).unwrap();
+        let home = std::env::temp_dir().join("cupel-select-codex");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        // A configured cloud provider precedes Codex in catalog order.
+        // Codex has no env var, so the test stays independent of exported keys.
+        let mut catalog = vec![cloud_model("cloud-1", "test-cloud")];
+        catalog.extend(
+            cupel_core::catalog::builtin_models()
+                .into_iter()
+                .filter(|m| m.provider.as_str() == "openai-codex"),
+        );
+        catalog.push(keyless_model("qwen3:8b"));
+        let mut settings = Settings::default();
+        settings.providers.insert("test-cloud".into(), "key".into());
+
+        // Without login, the configured cloud provider wins.
+        let (model, _) = select_model(&args, &catalog, &settings, Some(&home)).unwrap();
+        assert_eq!(model.id, "cloud-1");
+
+        // Logged in, codex wins, and carries no startup key because the
+        // api_key hook mints fresh access tokens per request instead.
+        let credential = cupel_core::oauth::openai_codex::OAuthCredential {
+            access: "a".into(),
+            refresh: "r".into(),
+            expires: 1,
+            account_id: "acc".into(),
+        };
+        cupel_coding_agent::auth::save_credential(Some(&home), "openai-codex", &credential)
+            .unwrap();
+        let (model, key) = select_model(&args, &catalog, &settings, Some(&home)).unwrap();
+        assert_eq!(model.id, "codex/gpt-6.1-sol");
+        assert!(key.is_none());
+
+        // Explicit model still overrides the Codex default.
+        let args = parse(&["--model", "cloud-1"]).unwrap();
+        let (model, key) = select_model(&args, &catalog, &settings, Some(&home)).unwrap();
+        assert_eq!(model.id, "cloud-1");
+        assert_eq!(key.as_deref(), Some("key"));
+    }
+
+    #[test]
+    fn select_model_defaults_to_gpt_61_sol_with_an_openai_key() {
+        let catalog = cupel_core::catalog::builtin_models()
+            .into_iter()
+            .filter(|model| model.provider.as_str() == "openai")
+            .collect::<Vec<_>>();
+        let mut settings = Settings::default();
+        settings
+            .providers
+            .insert("openai".into(), "test-key".into());
+
+        let (model, key) = select_model(&parse(&[]).unwrap(), &catalog, &settings, None).unwrap();
+        assert_eq!(model.id, "gpt-6.1-sol");
+        assert!(key.is_some());
+
+        let args = parse(&["--model", "gpt-6-astra"]).unwrap();
+        let (model, _) = select_model(&args, &catalog, &settings, None).unwrap();
+        assert_eq!(model.id, "gpt-6-astra", "explicit choices still win");
+    }
+
+    #[test]
+    fn select_model_honors_a_settings_key() {
+        let args = parse(&[]).unwrap();
+        let catalog = vec![
+            cloud_model("cloud-1", "test-cloud"),
+            keyless_model("qwen3:8b"),
+        ];
+        let mut settings = Settings::default();
+        settings
+            .providers
+            .insert("test-cloud".into(), "from-settings".into());
+
+        // Pass 1 finds the settings backed provider first.
+        let (model, key) = select_model(&args, &catalog, &settings, None).unwrap();
+        assert_eq!(model.id, "cloud-1");
+        assert_eq!(key.as_deref(), Some("from-settings"));
+
+        // Without the settings entry the same catalog falls through to
+        // the keyless local model.
+        let (model, key) = select_model(&args, &catalog, &Settings::default(), None).unwrap();
+        assert_eq!(model.id, "qwen3:8b");
+        assert!(key.is_none());
+
+        // Explicit model resolves the settings key too.
+        let args = parse(&["--model", "cloud-1"]).unwrap();
+        let (_, key) = select_model(&args, &catalog, &settings, None).unwrap();
+        assert_eq!(key.as_deref(), Some("from-settings"));
+    }
+
+    #[test]
+    fn thinking_defaults_to_high_for_codex_sol_only_and_respects_overrides() {
+        // Legacy Sol can still be supplied through a custom models.json.
+        let mut codex = cupel_core::catalog::builtin_models()
+            .into_iter()
+            .find(|m| m.id == "codex/gpt-6.1-sol")
+            .expect("shipped GPT-6.1 Sol model");
+        codex.id = "codex/gpt-6-sol".into();
+        let other_codex = cupel_core::catalog::builtin_models()
+            .into_iter()
+            .find(|m| m.id == "codex/gpt-6-astra")
+            .expect("shipped Codex model");
+        let args = parse(&[]).unwrap();
+        assert_eq!(
+            thinking_level(&args, &codex, None),
+            Some(ThinkingLevel::High)
+        );
+        assert_eq!(
+            thinking_level(&args, &other_codex, None),
+            Some(ThinkingLevel::Medium)
+        );
+        assert_eq!(
+            thinking_level(&args, &keyless_model("local"), None),
+            Some(ThinkingLevel::Medium)
+        );
+        // Even an explicit off is distinct from an unspecified default.
+        assert_eq!(
+            thinking_level(&parse(&["--thinking", "off"]).unwrap(), &codex, None),
+            None
+        );
+        assert_eq!(
+            thinking_level(&parse(&["--thinking", "medium"]).unwrap(), &codex, None),
+            Some(ThinkingLevel::Medium)
+        );
+        assert_eq!(
+            thinking_level(&parse(&["--thinking", "max"]).unwrap(), &codex, None),
+            Some(ThinkingLevel::Max)
+        );
+    }
+
+    /// Settings whose `default` preset names `provider`/`model`.
+    fn with_default_preset(provider: &str, model: &str) -> Settings {
+        let mut settings = Settings::default();
+        settings.presets.insert(
+            DEFAULT_PRESET.into(),
+            Preset {
+                provider: provider.into(),
+                model: model.into(),
+                thinking_level: cupel_coding_agent::settings::ThinkingSetting::Off,
+                prompt: None,
+            },
+        );
+        settings
+    }
+
+    #[test]
+    fn the_default_preset_picks_the_startup_model_unless_model_is_given() {
+        let catalog = vec![keyless_model("qwen3:8b"), keyless_model("llama3:8b")];
+        let settings = with_default_preset("ollama", "llama3:8b");
+
+        // Without model the preset beats the keyless auto pick (qwen38b).
+        let (model, _) = select_model(&parse(&[]).unwrap(), &catalog, &settings, None).unwrap();
+        assert_eq!(model.id, "llama3:8b");
+
+        // An explicit model beats the preset.
+        let args = parse(&["--model", "qwen3:8b"]).unwrap();
+        let (model, _) = select_model(&args, &catalog, &settings, None).unwrap();
+        assert_eq!(model.id, "qwen3:8b");
+
+        // Provider and id must match, a mismatch is an error that names
+        // the preset, not a silent fallback to the auto pick.
+        let settings = with_default_preset("anthropic", "llama3:8b");
+        let err = select_model(&parse(&[]).unwrap(), &catalog, &settings, None).unwrap_err();
+        assert!(err.contains("default preset: anthropic/llama3:8b"), "{err}");
+    }
+
+    #[test]
+    fn an_invalid_default_preset_stops_startup_like_an_unknown_model() {
+        let catalog = vec![keyless_model("qwen3:8b")];
+        let settings = Settings {
+            invalid_default_preset: Some(
+                "settings.json: unknown variant `High`, expected one of `off`, `low`".into(),
+            ),
+            ..Settings::default()
+        };
+
+        // Not a silent start on the keyless auto pick.
+        let err = select_model(&parse(&[]).unwrap(), &catalog, &settings, None).unwrap_err();
+        assert!(
+            err.contains("invalid default preset") && err.contains("High"),
+            "{err}"
+        );
+
+        // An explicit model still beats the broken preset.
+        let args = parse(&["--model", "qwen3:8b"]).unwrap();
+        let (model, _) = select_model(&args, &catalog, &settings, None).unwrap();
+        assert_eq!(model.id, "qwen3:8b");
+    }
+
+    #[test]
+    fn the_default_preset_sets_the_thinking_level_unless_thinking_is_given() {
+        let model = keyless_model("local");
+        let settings = with_default_preset("ollama", "local");
+        let preset = settings.presets.get(DEFAULT_PRESET);
+
+        // The preset says off, which beats the built in medium.
+        assert_eq!(thinking_level(&parse(&[]).unwrap(), &model, preset), None);
+        // An explicit thinking beats the preset.
+        let args = parse(&["--thinking", "high"]).unwrap();
+        assert_eq!(
+            thinking_level(&args, &model, preset),
+            Some(ThinkingLevel::High)
+        );
+    }
+}

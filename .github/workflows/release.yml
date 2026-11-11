@@ -1,0 +1,125 @@
+# Prepare the version and changelog in a tested PR, then push its version tag.
+# Linux binaries use musl, macOS binaries contain Apple Silicon and Intel slices.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: cupel-macos-universal
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: cupel-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact: cupel-linux-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+
+      - name: Verify prepared release metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [ "$RELEASE_TAG" != "v$version" ]; then
+            echo "error: tag $RELEASE_TAG does not match workspace version $version" >&2
+            exit 1
+          fi
+          grep -Fq "## [$RELEASE_TAG] - " CHANGELOG.md
+
+      - name: Install musl toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --locked --release -p cupel-tui -p cupel-acp --target aarch64-apple-darwin
+          cargo build --locked --release -p cupel-tui -p cupel-acp --target x86_64-apple-darwin
+          for binary in cupel cupel-acp; do
+            lipo -create \
+              target/aarch64-apple-darwin/release/$binary \
+              target/x86_64-apple-darwin/release/$binary \
+              -output "$binary"
+            # Put the input first and verify slices separately across Xcode versions.
+            lipo "$binary" -verify_arch arm64
+            lipo "$binary" -verify_arch x86_64
+          done
+
+      - name: Build (Linux musl)
+        if: runner.os == 'Linux'
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo build --locked --release -p cupel-tui -p cupel-acp --target ${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/{cupel,cupel-acp} .
+
+      - name: Package
+        run: |
+          tar -czf ${{ matrix.artifact }}.tar.gz cupel cupel-acp LICENSE README.md \
+            -C crates/cupel-acp examples
+          shasum -a 256 ${{ matrix.artifact }}.tar.gz > sha256sums.txt
+
+      - name: Verify release archive and clean installation
+        run: python3 packaging/check-release.py ${{ matrix.artifact }}.tar.gz sha256sums.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    concurrency:
+      group: release-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum cupel-*.tar.gz > sha256sums.txt
+
+      - name: Publish GitHub release
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --draft \
+              --title "cupel $GITHUB_REF_NAME" --generate-notes --verify-tag
+          fi
+          gh release upload "$GITHUB_REF_NAME" cupel-*.tar.gz sha256sums.txt --clobber
+          gh release edit "$GITHUB_REF_NAME" --draft=false
